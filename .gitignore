@@ -1,0 +1,53 @@
+# Archivo .gitignore para el proyecto SmallC a RISC-V
+
+# Archivos específicos de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Entornos virtuales de Python
+# Descomenta la línea correspondiente a tu gestor de entorno si lo usas
+# env/
+# venv/
+# .venv/
+# ENV/
+# .env/
+
+# Archivos generados por el compilador
+# Asumiendo que los archivos de salida del ensamblador se llaman output.asm o similar
+*.asm
+*.o       # Archivos objeto si compilas el ensamblador
+*.out     # Ejecutables si compilas y enlazas
+*.exe     # Ejecutables en Windows
+*.s       # Otra extensión común para archivos ensamblador
+
+# Archivos de prueba o ejemplos de entrada/salida (si no quieres versionarlos)
+# Si tienes muchos archivos .c de prueba y solo quieres versionar el compilador,
+# podrías considerar ignorarlos, o ser selectivo.
+# Por ahora, no los ignoraremos por defecto, ya que fib.c es parte del ejemplo.
+# test_outputs/
+
+# Archivos de configuración de IDEs/editores
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+nbproject/ # NetBeans
+*.swp # Vim swap files
+*~ # Archivos de respaldo de editores
+
+# Archivos de sistema operativo
+.DS_Store # macOS
+Thumbs.db # Windows
+
+# Logs
+*.log
+
+# Archivos de dependencias (si usas un gestor de paquetes como pipenv o poetry)
+# Pipfile.lock
+# poetry.lock
