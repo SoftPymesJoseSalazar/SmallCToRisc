@@ -36,14 +36,24 @@ stmt      : declaration
           | array_decl
           | if_stmt
           | while_stmt
+          | for_stmt
           | return_stmt
           | block                                  // Permite bloques como stmt
           | expression SEMICOLON                        -> expr_stmt
 
 // Estructuras de control
-if_stmt   : "if" "(" expression ")" stmt ["else" stmt] -> if_stmt
-while_stmt: "while" "(" expression ")" stmt              -> while_stmt
-return_stmt: "return" [expression] SEMICOLON           -> return_stmt
+if_stmt   : "if" "(" expression ")" block ["else" block] -> if
+while_stmt: "while" "(" expression ")" block             -> while
+for_stmt  : "for" "(" for_init SEMICOLON [expression] SEMICOLON for_update ")" block -> for_loop
+
+// Cláusulas especiales para el bucle for
+for_init  : [for_declaration | for_assignment | expression]
+for_declaration: TYPE ID ["=" expression]              -> for_declaration
+for_assignment : ID "=" expression                        -> for_assignment
+for_update : [(ID | array_access) "=" expression | expression]  -> for_update
+
+// Return
+return_stmt: "return" [expression] SEMICOLON               -> return
 
 // Expresiones
 ?expression: logic_expr
@@ -381,6 +391,65 @@ class ASTTransformer(Transformer):
 
     def variable(self, tok):
         return Variable(tok.value)
+
+    def for_declaration(self, type_token, id_token, *args):
+        """Maneja una declaración en la inicialización de un bucle for."""
+        var_type = type_token.value
+        var_name = id_token.value
+        value = None
+        # Si hay una expresión (args[1] sería el token '=', args[2] la expresión)
+        if len(args) > 1 and args[0].value == '=':
+            value = args[1]
+        return Declaration(var_name, var_type, value)
+    
+    def for_assignment(self, target, expr):
+        """Maneja una asignación en la inicialización o actualización de un bucle for."""
+        # target puede ser ID o array_access
+        if isinstance(target, Variable):
+            var_name = target.name
+        elif isinstance(target, ArrayAccess):
+            var_name = target
+        else:
+            var_name = target.value
+        
+        # Ahora tomamos directamente la expresión
+        return Assignment(var_name, expr)
+    
+    def for_update(self, *args):
+        """Maneja la cláusula de actualización en un bucle for."""
+        if not args:
+            return None
+        
+        # Si es una asignación o expresión, retornarla directamente
+        # Tomamos el primer elemento no nulo
+        for arg in args:
+            if arg is not None:
+                return arg
+        
+        return None
+    
+    def for_loop(self, *args):
+        """Crea un nodo For con inicialización, condición, actualización y cuerpo."""
+        # Depuración para ver qué argumentos recibimos
+        print(f"for_loop recibió {len(args)} argumentos")
+        
+        # Extraer los componentes relevantes
+        # Asumiendo que los argumentos significativos están en posiciones específicas
+        if len(args) >= 6:  # Si tenemos al menos 6 argumentos
+            init = args[0]
+            condition = args[2] if len(args) > 2 else None
+            update = args[4] if len(args) > 4 else None
+            body = args[-1]  # El último argumento debería ser siempre el cuerpo
+        else:
+            # Fallback si no tenemos suficientes argumentos
+            init, condition, update, body = None, None, None, None
+            if args:
+                body = args[-1]  # Asumimos que el último es el cuerpo
+        
+        # Si condition o update son None o listas vacías, usar None
+        condition = condition if condition else None
+        
+        return For(init=init, condition=condition, update=update, body=body)
 
 def parse(code: str) -> Program:
     """Parsea código SmallC y retorna un AST completo."""

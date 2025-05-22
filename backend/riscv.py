@@ -106,6 +106,14 @@ class RiscVGenerator:
         if node is None:
             return None
         
+        # Procedimiento principal para nodos AST tipados
+        method = f"visit_{type(node).__name__}"
+        if hasattr(self, method):
+            return getattr(self, method)(node)
+        
+        # --- COMPATIBILIDAD TEMPORAL CON FORMATOS ANTIGUOS ---
+        # Este código debe eliminarse gradualmente
+        
         # Manejo de nodos de tipo 'stmt'
         if isinstance(node, dict) and node.get('type') == 'stmt' and 'children' in node:
             # Si 'stmt' contiene children, visitar el primer hijo
@@ -147,34 +155,38 @@ class RiscVGenerator:
             if node['type'] in type_method_map:
                 method_name = type_method_map[node['type']]
                 if hasattr(self, method_name):
-                    # Crear objeto AST temporal para pasarlo al método
-                    from frontend.ast_nodes import Declaration, Assignment, If, While, Return, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
-                    
-                    if node['type'] == 'declaration':
-                        obj = Declaration(
-                            node.get('var_name', ''), 
-                            node.get('var_type', ''), 
-                            node.get('value', None)
-                        )
-                        return getattr(self, method_name)(obj)
-                    elif node['type'] == 'assignment':
-                        obj = Assignment(
-                            node.get('var_name', ''), 
-                            node.get('value', None)
-                        )
-                        return getattr(self, method_name)(obj)
-                    # Otros tipos aquí...
-                    
-                    # Si llegamos aquí, tratamos el nodo como está
-                    return getattr(self, method_name)(node)
+                    # DEPRECADO: Crear objeto AST temporal (esto debería eliminarse)
+                    try:
+                        # Intentar adaptar el nodo dict a su equivalente en AST
+                        from frontend.ast_nodes import Declaration, Assignment, If, While, Return, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
+                        
+                        if node['type'] == 'declaration':
+                            obj = Declaration(
+                                node.get('var_name', ''), 
+                                node.get('var_type', ''), 
+                                node.get('value', None)
+                            )
+                            return getattr(self, method_name)(obj)
+                        elif node['type'] == 'assignment':
+                            obj = Assignment(
+                                node.get('var_name', ''), 
+                                node.get('value', None)
+                            )
+                            return getattr(self, method_name)(obj)
+                        else:
+                            # Enviar el nodo dict tal cual
+                            return getattr(self, method_name)(node)
+                    except Exception as e:
+                        print(f"ERROR al adaptar nodo dict a AST: {e}")
+                        return getattr(self, method_name)(node)
             
             # Si no tenemos un método específico, pero es un nodo "hijo"
             if 'children' in node and isinstance(node['children'], list) and node['children']:
                 return self.visit(node['children'][0])
-                
-        # Manejo de árboles de Lark
+        
+        # Manejo de árboles de Lark (ESTO DEBERÍA ELIMINARSE)
         if isinstance(node, Tree):
-            if 'children' in dir(node) and node.children:
+            if hasattr(node, 'children') and node.children:
                 # Convertir Tree.children a una lista normal
                 children = list(node.children)
                 
@@ -201,28 +213,25 @@ class RiscVGenerator:
                     results.append(result)
             return results[-1] if results else None
         
-        # Procedimiento normal para nodos AST
-        method = f"visit_{type(node).__name__}"
-        if hasattr(self, method):
-            return getattr(self, method)(node)
-        else:
-            print(f"ADVERTENCIA: No hay método visit_{type(node).__name__} para {node}")
-            # Intenta devolver un valor si es posible
-            if hasattr(node, 'value'):
-                return node.value
-            return None
+        # Si llegamos aquí, no tenemos un manejador específico
+        print(f"ADVERTENCIA: No hay método visit_{type(node).__name__} para {node}")
+        # Intenta devolver un valor si es posible
+        if hasattr(node, 'value'):
+            return node.value
+        return None
 
     def visit_Function(self, fn):
         """Genera código para una función."""
         # Extraer información de la función según el formato del nodo
-        if isinstance(fn, dict):
-            fn_name = fn.get('name', '')
-            fn_params = fn.get('params', [])
-            fn_body = fn.get('body', {'statements': []})
-        else:
+        if isinstance(fn, Function):
             fn_name = fn.name
             fn_params = fn.params
             fn_body = fn.body
+        else:
+            # Compatibilidad temporal con formato diccionario
+            fn_name = fn.get('name', '')
+            fn_params = fn.get('params', [])
+            fn_body = fn.get('body', {'statements': []})
         
         # Registrar si es main
         if fn_name == "main":
@@ -230,7 +239,7 @@ class RiscVGenerator:
         
         # Inicializar tabla de símbolos para esta función
         self.symtab = {}
-        self.sp_offset = 0
+        self.sp_offset = 0  # Inicializar a 0, se ajustará después de procesar parámetros
         self.reg_idx = 0
         self.current_function = fn_name
         
@@ -241,43 +250,50 @@ class RiscVGenerator:
         self.emit(f".globl {fn_name}")
         self.emit(f"{fn_name}:")
         
-        # Prólogo - reservar espacio para variables locales y registros salvados
-        frame_size = 32  # Espacio mínimo para ra, s0 y algunos temporales
-        
-        # Prólogo estándar
-        self.emit(f"  addi sp, sp, -{frame_size}")
-        self.emit("  sw ra, 28(sp)")
-        self.emit("  sw s0, 24(sp)")
-        self.emit(f"  addi s0, sp, {frame_size}")  # s0 apunta al antiguo sp
-        
-        # Registrar parámetros en la tabla de símbolos
+        # Procesamiento de parámetros - guardamos su posición en el stack
+        last_param_offset = 0
         for i, p in enumerate(fn_params):
             # Extraer el nombre del parámetro según su formato
             param_name = None
-            if isinstance(p, str):
-                param_name = p
-            elif isinstance(p, dict):
-                if 'param_name' in p:
-                    param_name = p['param_name']
-                elif 'name' in p:
-                    param_name = p['name']
-            elif hasattr(p, 'name'):
+            if isinstance(p, Parameter):
                 param_name = p.name
-            
-            if not param_name:
+            elif isinstance(p, dict):
+                param_name = p.get('param_name') or p.get('name')
+            else:
                 param_name = f"param{i}"
-                print(f"ADVERTENCIA: No se pudo extraer nombre del parámetro {i}, usando {param_name}")
+                print(f"ADVERTENCIA: Formato de parámetro no reconocido: {p}")
             
             # Guardar parámetro en el stack y registrarlo en la tabla de símbolos
             off = -4 * (i + 1)
             self.symtab[param_name] = off
-            self.emit(f"  sw a{i}, {off}(s0)   # param {param_name}")
+            last_param_offset = off  # Guardar el último offset usado por parámetros
+        
+        # CORRECCIÓN: Inicializar sp_offset para que comience DESPUÉS de los parámetros
+        self.sp_offset = last_param_offset
         
         # Depuración: mostrar tabla de símbolos después de registrar parámetros
         print(f"DEBUG: SYMTAB inicial para {fn_name}: {self.symtab}")
         
         # Pre-procesar declaraciones para reservar espacio
-        self.pre_process_declarations(fn_body)
+        required_locals_space = self.pre_process_declarations(fn_body)
+        
+        # MEJORA: Cálculo dinámico del tamaño del frame
+        saved_regs_space = 8  # ra y s0
+        total_locals_space = abs(self.sp_offset)  # Convertir a positivo
+        frame_size = total_locals_space + saved_regs_space
+        frame_size = (frame_size + 15) & ~15  # Alinear a 16 bytes
+        
+        # Prólogo - reservar espacio para variables locales y registros salvados
+        self.emit(f"  addi sp, sp, -{frame_size}")
+        self.emit(f"  sw ra, {frame_size-4}(sp)")
+        self.emit(f"  sw s0, {frame_size-8}(sp)")
+        self.emit(f"  addi s0, sp, {frame_size}")  # s0 apunta al antiguo sp
+        
+        # Ahora transferimos los argumentos desde a0-aN a sus posiciones en el stack
+        for i, p in enumerate(fn_params):
+            param_name = p.name if isinstance(p, Parameter) else f"param{i}"
+            off = self.symtab[param_name]
+            self.emit(f"  sw a{i}, {off}(s0)   # param {param_name}")
         
         # Depuración: mostrar tabla de símbolos después de pre-procesar
         print(f"DEBUG: SYMTAB final para {fn_name}: {self.symtab}")
@@ -287,61 +303,64 @@ class RiscVGenerator:
         
         # Epílogo
         self.emit(f".exit_{fn_name}:")
-        self.emit("  lw s0, 24(sp)")
-        self.emit("  lw ra, 28(sp)")
+        self.emit(f"  lw s0, {frame_size-8}(sp)")
+        self.emit(f"  lw ra, {frame_size-4}(sp)")
         self.emit(f"  addi sp, sp, {frame_size}")
         self.emit("  ret")
 
     def pre_process_declarations(self, node):
-        """Procesa todas las declaraciones en un bloque primero para registrarlas en la tabla de símbolos"""
-        # Si es un dict con tipo bloque, procesar sus statements
-        if isinstance(node, dict) and node.get('type') == 'block' and 'statements' in node:
-            for stmt in node['statements']:
-                self.pre_process_declarations(stmt)
-            return
+        """Procesa todas las declaraciones en un bloque primero para registrarlas en la tabla de símbolos.
+        Retorna el espacio total requerido para variables locales."""
+        # MEJORA: Retornar el espacio necesario para variables locales
+        initial_sp_offset = self.sp_offset
         
-        # Si es un bloque normal
-        if hasattr(node, 'statements'):
+        # Si es un bloque tipado (Block de ast_nodes)
+        if isinstance(node, Block):
             for stmt in node.statements:
                 self.pre_process_declarations(stmt)
-            return
-        
-        # Si es un stmt con children, procesar el primer hijo
-        if isinstance(node, dict) and node.get('type') == 'stmt' and 'children' in node:
-            if node['children'] and len(node['children']) > 0:
-                self.pre_process_declarations(node['children'][0])
-            return
-        
+        # Compatibilidad temporal con formato dict
+        elif isinstance(node, dict) and node.get('type') == 'block' and 'statements' in node:
+            for stmt in node.get('statements', []):
+                self.pre_process_declarations(stmt)
         # Si es una declaración, procesarla
-        if (isinstance(node, Declaration) or 
-            (isinstance(node, dict) and node.get('type') == 'declaration')):
-            
-            if isinstance(node, Declaration):
-                var_name = node.var_name
-            else:
-                var_name = node.get('var_name', '')
-            
+        elif isinstance(node, Declaration):
+            self.sp_offset -= 4
+            self.symtab[node.var_name] = self.sp_offset
+            print(f"REGISTRO: Variable {node.var_name} en offset {self.sp_offset}")
+        # Compatibilidad temporal con formato dict para declaraciones
+        elif isinstance(node, dict) and node.get('type') == 'declaration':
+            var_name = node.get('var_name', '')
             self.sp_offset -= 4
             self.symtab[var_name] = self.sp_offset
             print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
-        
         # Si es un if, procesar ambos bloques
-        if isinstance(node, dict) and node.get('type') == 'if':
-            if 'body' in node:
-                self.pre_process_declarations(node['body'])
-            if 'else_body' in node and node['else_body']:
-                self.pre_process_declarations(node['else_body'])
         elif isinstance(node, If):
             self.pre_process_declarations(node.true_body)
             if node.false_body:
                 self.pre_process_declarations(node.false_body)
-        
+        # Compatibilidad temporal con formato dict para if
+        elif isinstance(node, dict) and node.get('type') == 'if':
+            if 'body' in node or 'true_body' in node:
+                body = node.get('body') or node.get('true_body')
+                self.pre_process_declarations(body)
+            if ('else_body' in node and node['else_body']) or ('false_body' in node and node['false_body']):
+                else_body = node.get('else_body') or node.get('false_body')
+                self.pre_process_declarations(else_body)
         # Si es un while, procesar su bloque
-        if isinstance(node, dict) and node.get('type') == 'while':
-            if 'body' in node:
-                self.pre_process_declarations(node['body'])
         elif isinstance(node, While):
             self.pre_process_declarations(node.body)
+        # Compatibilidad temporal con formato dict para while
+        elif isinstance(node, dict) and node.get('type') == 'while':
+            if 'body' in node:
+                self.pre_process_declarations(node.get('body'))
+        # Si es un for, procesar inicialización y cuerpo
+        elif isinstance(node, For):
+            if node.init:
+                self.pre_process_declarations(node.init)
+            self.pre_process_declarations(node.body)
+        
+        # Retornar el espacio requerido para variables locales
+        return abs(self.sp_offset - initial_sp_offset)
 
     def visit_Block(self, blk: Block):
         for stmt in blk.statements:
@@ -700,3 +719,4 @@ class RiscVGenerator:
 
         # 5. Fin del bucle
         self.emit(f"{L_end}:")
+

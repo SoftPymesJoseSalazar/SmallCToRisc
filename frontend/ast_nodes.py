@@ -58,9 +58,9 @@ class ExprStmt(Statement):
 
 @dataclass
 class For(Statement):
-    init: Optional[Statement]        # Inicialización (ej. int i = 0; o i = 0;)
+    init: Optional['Statement']       # Inicialización (ej. i = 0)
     condition: Optional['Expression'] # Condición (ej. i < 10)
-    update: Optional['Expression']    # Actualización (ej. i++)
+    update: Optional['Statement']     # Actualización (ej. i++)
     body: Block                      # Cuerpo del bucle
 
 # — Expresiones —
