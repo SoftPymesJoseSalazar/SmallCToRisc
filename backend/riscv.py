@@ -1,344 +1,702 @@
+from frontend.ast_nodes import *
+from lark import Tree, Token
+
 class RiscVGenerator:
     def __init__(self):
         self.output = []
+        self.regs = [f"x{i}" for i in range(5, 15)]
+        self.reg_idx = 0
+        self.symtab = {}
+        self.sp_offset = 0
         self.label_count = 0
-        self.symbol_table = {}
-        self.array_table = {}
-        self.current_stack_offset = 0
-        self.registers = [f"x{i}" for i in range(5, 10)]  # t0-t4 en RISC-V
-        self.current_register = 0
-        self.current_function = None  # Almacenar el nombre de la función actual
+        self.current_function = ""
+        self.globals = set()  # Para registrar variables globales
+        self.has_main = False  # Para verificar si hay una función main
+
+    def new_reg(self):
+        r = self.regs[self.reg_idx]
+        self.reg_idx = (self.reg_idx + 1) % len(self.regs)
+        return r
 
     def new_label(self):
         self.label_count += 1
         return f"L{self.label_count}"
 
-    def get_register(self):
-        reg = self.registers[self.current_register]
-        self.current_register = (self.current_register + 1) % len(self.registers)
-        return reg
+    def emit(self, code):
+        self.output.append(code)
 
-    def emit(self, instruction):
-        self.output.append(instruction)
+    def _flatten(self, items):
+        """
+        Aplanar una lista de nodos de alto nivel que pueden
+        venir como {'type':'top_level', 'children':[...]}
+        o {'type':'global_decl', 'children':[...]}.
+        Devuelve una lista de nodos reales (Declaration, Function, etc.).
+        """
+        flat = []
+        for node in items:
+            # Si es un dict con tipo top_level o global_decl
+            if isinstance(node, dict) and node.get('type') in ('top_level','global_decl'):
+                ch = node.get('children',[]) or node.get('statements',[])
+                flat.extend(self._flatten(ch))
+            else:
+                flat.append(node)
+        return flat
 
-    def generate(self, ast):
-        """Punto de entrada principal para generación de código"""
-        for node in ast:
+    def generate(self, program: Program) -> str:
+        """Genera código ensamblador RISC-V para todo el programa."""
+        # 0) Extraer y aplanar nodos de alto nivel
+        if hasattr(program, 'functions'):
+            raw = program.functions
+        elif hasattr(program, 'statements'):
+            raw = program.statements
+        elif isinstance(program, dict):
+            raw = program.get('children', []) or program.get('statements', [])
+        else:
+            raw = []
+        items = self._flatten(raw)
+
+        # 1) Detectar función main
+        for node in items:
+            if (isinstance(node, Function) or (isinstance(node, dict) and node.get('type')=='function')) \
+               and (getattr(node, 'name', node.get('name')) == "main"):
+                self.has_main = True
+                break
+
+        # 2) Sección .data: globals y arrays
+        self.emit(".data")
+        for node in items:
+            # Procesamos todos los nodos de declaración global
+            if (isinstance(node, ArrayDeclaration) or 
+                isinstance(node, Declaration) or
+                (isinstance(node, dict) and node.get('type') in ('array_declaration', 'declaration'))):
+                self.visit(node)
+
+        # 3) Sección .text y etiqueta _start
+        self.emit(".text")
+        self.emit("  .globl _start")
+        self.emit("_start:")
+        
+        # Inicialización de globals (asignaciones top-level)
+        for node in items:
+            # Procesamos TODOS los nodos, dejando que visit() decida qué hacer
             self.visit(node)
+
+        # Llamar a main si existe
+        if self.has_main:
+            self.emit("  call main")
+        # Exit syscall
+        self.emit("  li a0, 0")
+        self.emit("  li a7, 93")
+        self.emit("  ecall")
+
+        # 4) Generar cada función (prólogos, cuerpo y epílogos)
+        for node in items:
+            if (isinstance(node, Function) or 
+                (isinstance(node, dict) and node.get('type')=='function')):
+                # establecer current_function para los retornos
+                name = node.name if isinstance(node, Function) else node.get('name')
+                self.current_function = name
+                self.visit(node)
+
         return "\n".join(self.output)
 
     def visit(self, node):
-        """Método de despacho para visitar nodos AST"""
-        if isinstance(node, list):
-            for item in node:
-                self.visit(item)
-            return
-
-        method_name = f"visit_{node['type']}"
-        visitor = getattr(self, method_name, self.generic_visit)
-        return visitor(node)
-
-    def generic_visit(self, node):
-        raise Exception(f"No hay método visit_{node['type']} definido")
-
-    def visit_function_decl(self, node):
-        func_name = node['name']
-        self.emit(f".globl {func_name}")
-        self.emit(".text")
-        self.emit(f"{func_name}:")
+        """Visita un nodo del AST y retorna el resultado"""
+        # Si es None, retornar
+        if node is None:
+            return None
         
-        # Prologue
-        self.emit("addi sp, sp, -32")
-        self.emit("sw ra, 28(sp)")
-        self.emit("sw s0, 24(sp)")
-        self.emit("addi s0, sp, 32")
-        self.current_stack_offset = -20  # Empezamos después de ra y s0
-
-        # Guardar parámetros (asumimos solo un parámetro por simplicidad)
-        if 'params' in node and node['params']:
-            for param in node['params']:
-                self.emit(f"sw a0, {self.current_stack_offset}(s0)  # guardar param {param['param_name']}")
-                self.symbol_table[param['param_name']] = {
-                    'offset': self.current_stack_offset,
-                    'type': param['param_type']
-                }
-                self.current_stack_offset -= 4
-
-        # Visitar cuerpo de la función
-        self.visit(node['body'])
-
-        # Epilogue (se ejecuta si no hay return explícito)
-        self.emit("lw s0, 24(sp)")
-        self.emit("lw ra, 28(sp)")
-        self.emit("addi sp, sp, 32")
-        self.emit("ret")
-
-    def visit_return_stmt(self, node):
-        if node['expression'] is not None:
-            result_reg = self.visit(node['expression'])
-            self.emit(f"mv a0, {result_reg}  # return")
+        # Manejo de nodos de tipo 'stmt'
+        if isinstance(node, dict) and node.get('type') == 'stmt' and 'children' in node:
+            # Si 'stmt' contiene children, visitar el primer hijo
+            if node['children'] and len(node['children']) > 0:
+                return self.visit(node['children'][0])
+            return None
         
-        # Saltar al epílogo
-        self.emit("lw s0, 24(sp)")
-        self.emit("lw ra, 28(sp)")
-        self.emit("addi sp, sp, 32")
-        self.emit("ret")
-
-    def visit_variable(self, node):
-        if node['name'] not in self.symbol_table:
-            raise Exception(f"Variable '{node['name']}' no definida")
-        
-        reg = self.get_register()
-        offset = self.symbol_table[node['name']]['offset']
-        self.emit(f"lw {reg}, {offset}(s0)  # cargar variable {node['name']}")
-        return reg
-
-    def visit_if_stmt(self, node):
-        else_label = self.new_label()
-        end_label = self.new_label()
-        
-        # Evaluar condición
-        cond_reg = self.visit(node['condition'])
-        self.emit(f"beqz {cond_reg}, {else_label}  # if")
-
-        # Bloque verdadero
-        self.visit(node['true_body'])
-        self.emit(f"j {end_label}")
-
-        # Bloque else (si existe)
-        self.emit(f"{else_label}:")
-        if node['false_body'] is not None:
-            self.visit(node['false_body'])
-        
-        self.emit(f"{end_label}:")
-
-    def visit_function_call(self, node):
-        if node['name'] == 'fib':
-            # Cargar argumento (10 para fib)
-            self.emit("li a0, 10")
-            self.emit("jal fib")
-            # Guardar resultado
-            result_reg = self.get_register()
-            self.emit(f"mv {result_reg}, a0")
-            return result_reg
-        else:
-            # Pasar argumentos (solo 1 arg en fib)
-            if node['args']:
-                arg_reg = self.visit(node['args'][0])
-                self.emit(f"mv a0, {arg_reg}")
-            
-            self.emit(f"jal {node['name']}")
-            result_reg = self.get_register()
-            self.emit(f"mv {result_reg}, a0")
-            return result_reg
-
-    def visit_binary_op(self, node):
-        left_reg = self.visit(node['left'])
-        right_reg = self.visit(node['right'])
-        result_reg = self.get_register()
-        
-        if node['op'] == '+':
-            self.emit(f"add {result_reg}, {left_reg}, {right_reg}  # suma")
-        elif node['op'] == '-':
-            self.emit(f"sub {result_reg}, {left_reg}, {right_reg}  # resta")
-        elif node['op'] == '*':
-            self.emit(f"mul {result_reg}, {left_reg}, {right_reg}  # multiplicación")
-        elif node['op'] == '/':
-            self.emit(f"div {result_reg}, {left_reg}, {right_reg}  # división")
-        else:
-            raise Exception(f"Operador no soportado: {node['op']}")
-        
-        return result_reg
-
-    def visit_function(self, node):
-        """Maneja definiciones de funciones"""
-        self.symbol_table = {}  # Limpiar tabla de símbolos para cada función
-        self.current_stack_offset = 0 # Empezar desde 0 para calcular offsets negativos alineados
-        self.current_function = node['name']
-
-        func_name = node['name']
-        self.emit(f".globl {func_name}")
-        self.emit(".text")
-        self.emit(f"{func_name}:")
-
-        # Prólogo consistente
-        self.emit("addi sp, sp, -32")  # Tamaño fijo para simplicidad
-        self.emit("sw ra, 28(sp)")     # Guardar dirección de retorno
-        self.emit("sw s0, 24(sp)")     # Guardar frame pointer
-        self.emit("addi s0, sp, 32")   # Establecer nuevo frame pointer
-
-        # Guardar parámetros (asumimos solo un parámetro por simplicidad para fib)
-        if 'params' in node and node['params']:
-            for param in node['params']:
-                # Los parámetros se manejan de forma especial, a0, a1, etc.
-                # Aquí asumimos que el primer parámetro (n para fib) se guarda en la pila.
-                self.current_stack_offset -= 4 # Decrementar primero para el primer offset
-                self.symbol_table[param['param_name']] = {
-                    'offset': self.current_stack_offset,
-                    'type': param['param_type']
-                }
-                self.emit(f"sw a0, {self.current_stack_offset}(s0)  # param {param['param_name']}")
-
-
-        # Visitar declaraciones y cuerpo
-        # Para main, manejar la llamada a fib ANTES de procesar su 'return'
-        if func_name == 'main':
-            # Declarar 'result' primero para asignarle un offset
-            for stmt in node['body']:
-                if stmt['type'] == 'declaration' and stmt['var_name'] == 'result':
-                    self.visit_declaration(stmt) # Asegura que 'result' tenga un offset
-                    break # Salir después de declarar result
-
-            self.emit("li a0, 10")
-            self.emit("jal fib")
-            # Guardar el resultado de fib(10) en la variable 'result'
-            result_offset = self.symbol_table['result']['offset']
-            self.emit(f"sw a0, {result_offset}(s0)  # guardar result = fib(10)")
-
-            # Procesar el resto del cuerpo de main (solo debería ser el return)
-            for stmt in node['body']:
-                if not (stmt['type'] == 'declaration' and stmt['var_name'] == 'result'):
-                    self.visit(stmt)
-        else:
-            # Para otras funciones (como fib), procesar el cuerpo normalmente
-            self.visit(node['body'])
-
-        # Epílogo (un solo punto de salida)
-        # No generar epílogo si ya se hizo un ret (aunque aquí siempre saltamos al final)
-        end_label = f"{func_name}_end"
-        self.emit(f"{end_label}:") # Etiqueta para saltos de return
-        self.emit("lw s0, 24(sp)")
-        self.emit("lw ra, 28(sp)")
-        self.emit("addi sp, sp, 32")
-        self.emit("ret")
-
-    def visit_parameter(self, node):
-        self.current_stack_offset -= 4
-        self.symbol_table[node['param_name']] = {
-            'offset': self.current_stack_offset,
-            'type': node['param_type']
-        }
-        self.emit(f"sw a0, {self.current_stack_offset}(s0)  # guardar param {node['param_name']}")
-
-    def visit_declaration(self, node):
-        var_name = node['var_name']['name'] if isinstance(node['var_name'], dict) else node['var_name']
-        
-        # Solo asignar offset si la variable no es un parámetro ya procesado
-        if var_name not in self.symbol_table:
-            self.current_stack_offset -= 4 # Decrementar para obtener un nuevo offset negativo alineado
-            self.symbol_table[var_name] = {'offset': self.current_stack_offset, 'type': node['var_type']}
-        
-        # Inicialización basada en el AST o valores por defecto
-        # Evitar inicializar 'result' en 'main' aquí si ya se le asignó el valor de fib(10)
-        if var_name == 'result' and self.current_function == 'main':
-            # No hacer nada aquí, 'result' se asigna después de llamar a fib
-            pass
-        elif node.get('value') is None: # Si el AST no especifica valor inicial
-            if var_name == 'a' and self.current_function == 'fib':
-                self.emit(f"li t0, 0")
-                self.emit(f"sw t0, {self.symbol_table[var_name]['offset']}(s0)  # {var_name} = 0")
-            elif var_name == 'b' and self.current_function == 'fib':
-                self.emit(f"li t0, 1")
-                self.emit(f"sw t0, {self.symbol_table[var_name]['offset']}(s0)  # {var_name} = 1")
-            elif var_name == 'i' and self.current_function == 'fib':
-                self.emit(f"li t0, 2")
-                self.emit(f"sw t0, {self.symbol_table[var_name]['offset']}(s0)  # {var_name} = 2")
-            elif var_name == 'temp' and self.current_function == 'fib':
-                 # temp no necesita inicialización explícita a cero si siempre se le asigna a+b antes de usarla
-                self.emit(f"sw zero, {self.symbol_table[var_name]['offset']}(s0)  # init {var_name}")
-            # Para otras variables no inicializadas explícitamente, podrías inicializarlas a cero o dejarlo
-            # else:
-            #    self.emit(f"sw zero, {self.symbol_table[var_name]['offset']}(s0)  # init {var_name}")
-        else:
-            # Si el AST tuviera un valor de inicialización, se manejaría aquí
-            # value_reg = self.visit(node['value'])
-            # self.emit(f"sw {value_reg}, {self.symbol_table[var_name]['offset']}(s0)  # init {var_name}")
-            pass # Por ahora, las inicializaciones específicas se manejan arriba
-
-    def visit_assignment(self, node):
-        var_name_node = node['var_name']
-        var_name = var_name_node['name'] if isinstance(var_name_node, dict) else var_name_node
-        
-        if var_name == 'temp' and self.current_function == 'fib':
-            # Asumimos que el AST para el valor es solo 'a', pero necesitamos 'a' y 'b'
-            a_reg = self.visit({'type': 'variable', 'name': 'a'})
-            b_reg = self.visit({'type': 'variable', 'name': 'b'})
-            result_reg = self.get_register() 
-            self.emit(f"add {result_reg}, {a_reg}, {b_reg}  # temp = a + b")
-            self.emit(f"sw {result_reg}, {self.symbol_table['temp']['offset']}(s0)")
-            # No es necesario devolver result_reg aquí
-        elif var_name == 'i' and isinstance(node['value'], dict) and \
-             node['value']['type'] == 'variable' and node['value']['name'] == 'i' and \
-             self.current_function == 'fib':
-            # Manejar i = i + 1 (representado como i = i en el AST)
-            # Esta es la ÚNICA sección que debe generar el incremento para la asignación i=i.
-            i_val_reg = self.visit({'type': 'variable', 'name': 'i'}) # Cargar valor actual de i
-            self.emit(f"addi {i_val_reg}, {i_val_reg}, 1  # i = i + 1")
-            self.emit(f"sw {i_val_reg}, {self.symbol_table['i']['offset']}(s0)")
-            # No debe haber más código aquí que genere otro incremento para ESTE nodo de asignación.
-        else:
-            # Manejo para otras asignaciones, como a = b o b = temp
-            value_reg = self.visit(node['value'])
-            comment = f"{var_name} = ..."
-            if isinstance(node['value'], dict) and node['value']['type'] == 'variable':
-                comment = f"{var_name} = {node['value']['name']}"
-            self.emit(f"sw {value_reg}, {self.symbol_table[var_name]['offset']}(s0)  # {comment}")
-
-    def visit_if(self, node):
-        """Maneja statements condicionales if"""
-        # Evaluar condición (n == 0)
-        cond_reg = self.visit(node['condition'])
-        else_label = self.new_label()
-        
-        # La condición original es beqz (salta si es cero)
-        self.emit(f"beqz {cond_reg}, then_block  # if (n == 0)")
-        self.emit(f"j {else_label}")  # Si no es cero, saltamos
-        
-        # Bloque then (se ejecuta si n == 0)
-        self.emit("then_block:")
-        self.visit(node['true_body'])
-        
-        # Bloque else
-        self.emit(f"{else_label}:")
-        if node['false_body'] is not None:
-            self.visit(node['false_body'])
-
-    def visit_while(self, node):
-        """Maneja bucles while"""
-        start_label = self.new_label()
-        end_label = self.new_label()
-        
-        self.emit(f"{start_label}:")
-        
-        # Para i <= n, ya que el AST solo tiene i como condición
-        # Cargar i
-        i_reg = self.visit(node['condition'])
-        # Cargar n para comparar
-        n_reg = self.visit({'type': 'variable', 'name': 'n'})
-        self.emit(f"bgt {i_reg}, {n_reg}, {end_label}  # while i <= n")
-        
-        # Cuerpo del bucle
-        self.visit(node['body'])
-        
-        self.emit(f"j {start_label}  # volver al inicio del bucle")
-        self.emit(f"{end_label}:")
-
-    def visit_number(self, node):
-        reg = self.get_register()
-        self.emit(f"li {reg}, {node['value']}  # cargar entero")
-        return reg
-
-    def visit_return(self, node):
-        """Maneja statements de return"""
-        if node['expression'] is not None:
-            result_reg = self.visit(node['expression'])
-            self.emit(f"mv a0, {result_reg}  # return value")
-        
-        # Usar self.current_function en lugar de node['_function_name']
-        self.emit(f"j {self.current_function}_end")
-
-    def visit_block(self, node):
-        """Maneja bloques de código (conjunto de statements entre llaves)"""
-        if 'statements' in node:
+        # Manejo de bloques en nodos dict
+        if isinstance(node, dict) and node.get('type') == 'block' and 'statements' in node:
+            # Para cada declaración en el bloque
             for stmt in node['statements']:
                 self.visit(stmt)
+            return None
+        
+        # Si es un diccionario con 'type', procesarlo según su tipo
+        if isinstance(node, dict) and 'type' in node:
+            # Mapeo de nombres de métodos para tipos de nodos
+            type_method_map = {
+                'declaration': 'visit_Declaration',
+                'assignment': 'visit_Assignment',
+                'if': 'visit_If',
+                'while': 'visit_While',
+                'return': 'visit_Return',
+                'function_call': 'visit_FuncCall',
+                'binary_op': 'visit_BinaryOp',
+                'variable': 'visit_Variable',
+                'number': 'visit_Number',
+                'function': 'visit_Function',
+                'block': 'visit_Block',
+                'parameter': 'visit_Parameter',
+                'program': 'visit_Program',
+                'array_access': 'visit_ArrayAccess',
+                'array_declaration': 'visit_ArrayDeclaration',
+                'multi_declaration': 'visit_MultiDeclaration',
+                'for': 'visit_For'
+            }
+            
+            # Si tenemos un método para este tipo
+            if node['type'] in type_method_map:
+                method_name = type_method_map[node['type']]
+                if hasattr(self, method_name):
+                    # Crear objeto AST temporal para pasarlo al método
+                    from frontend.ast_nodes import Declaration, Assignment, If, While, Return, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
+                    
+                    if node['type'] == 'declaration':
+                        obj = Declaration(
+                            node.get('var_name', ''), 
+                            node.get('var_type', ''), 
+                            node.get('value', None)
+                        )
+                        return getattr(self, method_name)(obj)
+                    elif node['type'] == 'assignment':
+                        obj = Assignment(
+                            node.get('var_name', ''), 
+                            node.get('value', None)
+                        )
+                        return getattr(self, method_name)(obj)
+                    # Otros tipos aquí...
+                    
+                    # Si llegamos aquí, tratamos el nodo como está
+                    return getattr(self, method_name)(node)
+            
+            # Si no tenemos un método específico, pero es un nodo "hijo"
+            if 'children' in node and isinstance(node['children'], list) and node['children']:
+                return self.visit(node['children'][0])
+                
+        # Manejo de árboles de Lark
+        if isinstance(node, Tree):
+            if 'children' in dir(node) and node.children:
+                # Convertir Tree.children a una lista normal
+                children = list(node.children)
+                
+                # Para cada hijo en el árbol
+                results = []
+                for child in children:
+                    result = self.visit(child)
+                    if result is not None:
+                        results.append(result)
+                
+                # Retornar el último resultado no-None
+                return results[-1] if results else None
+        
+        # Si es un Token, obtén su valor
+        if isinstance(node, Token) or (hasattr(node, 'type') and hasattr(node, 'value')):
+            return node.value
+        
+        # Si es una lista, procesar cada elemento
+        if isinstance(node, list):
+            results = []
+            for item in node:
+                result = self.visit(item)
+                if result is not None:
+                    results.append(result)
+            return results[-1] if results else None
+        
+        # Procedimiento normal para nodos AST
+        method = f"visit_{type(node).__name__}"
+        if hasattr(self, method):
+            return getattr(self, method)(node)
+        else:
+            print(f"ADVERTENCIA: No hay método visit_{type(node).__name__} para {node}")
+            # Intenta devolver un valor si es posible
+            if hasattr(node, 'value'):
+                return node.value
+            return None
+
+    def visit_Function(self, fn):
+        """Genera código para una función."""
+        # Extraer información de la función según el formato del nodo
+        if isinstance(fn, dict):
+            fn_name = fn.get('name', '')
+            fn_params = fn.get('params', [])
+            fn_body = fn.get('body', {'statements': []})
+        else:
+            fn_name = fn.name
+            fn_params = fn.params
+            fn_body = fn.body
+        
+        # Registrar si es main
+        if fn_name == "main":
+            self.has_main = True
+        
+        # Inicializar tabla de símbolos para esta función
+        self.symtab = {}
+        self.sp_offset = 0
+        self.reg_idx = 0
+        self.current_function = fn_name
+        
+        # Depuración: mostrar parámetros recibidos
+        print(f"DEBUG: Función {fn_name} con parámetros: {fn_params}")
+        
+        # Cabecera de función
+        self.emit(f".globl {fn_name}")
+        self.emit(f"{fn_name}:")
+        
+        # Prólogo - reservar espacio para variables locales y registros salvados
+        frame_size = 32  # Espacio mínimo para ra, s0 y algunos temporales
+        
+        # Prólogo estándar
+        self.emit(f"  addi sp, sp, -{frame_size}")
+        self.emit("  sw ra, 28(sp)")
+        self.emit("  sw s0, 24(sp)")
+        self.emit(f"  addi s0, sp, {frame_size}")  # s0 apunta al antiguo sp
+        
+        # Registrar parámetros en la tabla de símbolos
+        for i, p in enumerate(fn_params):
+            # Extraer el nombre del parámetro según su formato
+            param_name = None
+            if isinstance(p, str):
+                param_name = p
+            elif isinstance(p, dict):
+                if 'param_name' in p:
+                    param_name = p['param_name']
+                elif 'name' in p:
+                    param_name = p['name']
+            elif hasattr(p, 'name'):
+                param_name = p.name
+            
+            if not param_name:
+                param_name = f"param{i}"
+                print(f"ADVERTENCIA: No se pudo extraer nombre del parámetro {i}, usando {param_name}")
+            
+            # Guardar parámetro en el stack y registrarlo en la tabla de símbolos
+            off = -4 * (i + 1)
+            self.symtab[param_name] = off
+            self.emit(f"  sw a{i}, {off}(s0)   # param {param_name}")
+        
+        # Depuración: mostrar tabla de símbolos después de registrar parámetros
+        print(f"DEBUG: SYMTAB inicial para {fn_name}: {self.symtab}")
+        
+        # Pre-procesar declaraciones para reservar espacio
+        self.pre_process_declarations(fn_body)
+        
+        # Depuración: mostrar tabla de símbolos después de pre-procesar
+        print(f"DEBUG: SYMTAB final para {fn_name}: {self.symtab}")
+        
+        # Visitar el cuerpo de la función
+        self.visit(fn_body)
+        
+        # Epílogo
+        self.emit(f".exit_{fn_name}:")
+        self.emit("  lw s0, 24(sp)")
+        self.emit("  lw ra, 28(sp)")
+        self.emit(f"  addi sp, sp, {frame_size}")
+        self.emit("  ret")
+
+    def pre_process_declarations(self, node):
+        """Procesa todas las declaraciones en un bloque primero para registrarlas en la tabla de símbolos"""
+        # Si es un dict con tipo bloque, procesar sus statements
+        if isinstance(node, dict) and node.get('type') == 'block' and 'statements' in node:
+            for stmt in node['statements']:
+                self.pre_process_declarations(stmt)
+            return
+        
+        # Si es un bloque normal
+        if hasattr(node, 'statements'):
+            for stmt in node.statements:
+                self.pre_process_declarations(stmt)
+            return
+        
+        # Si es un stmt con children, procesar el primer hijo
+        if isinstance(node, dict) and node.get('type') == 'stmt' and 'children' in node:
+            if node['children'] and len(node['children']) > 0:
+                self.pre_process_declarations(node['children'][0])
+            return
+        
+        # Si es una declaración, procesarla
+        if (isinstance(node, Declaration) or 
+            (isinstance(node, dict) and node.get('type') == 'declaration')):
+            
+            if isinstance(node, Declaration):
+                var_name = node.var_name
+            else:
+                var_name = node.get('var_name', '')
+            
+            self.sp_offset -= 4
+            self.symtab[var_name] = self.sp_offset
+            print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
+        
+        # Si es un if, procesar ambos bloques
+        if isinstance(node, dict) and node.get('type') == 'if':
+            if 'body' in node:
+                self.pre_process_declarations(node['body'])
+            if 'else_body' in node and node['else_body']:
+                self.pre_process_declarations(node['else_body'])
+        elif isinstance(node, If):
+            self.pre_process_declarations(node.true_body)
+            if node.false_body:
+                self.pre_process_declarations(node.false_body)
+        
+        # Si es un while, procesar su bloque
+        if isinstance(node, dict) and node.get('type') == 'while':
+            if 'body' in node:
+                self.pre_process_declarations(node['body'])
+        elif isinstance(node, While):
+            self.pre_process_declarations(node.body)
+
+    def visit_Block(self, blk: Block):
+        for stmt in blk.statements:
+            self.visit(stmt)
+
+    def visit_Declaration(self, d: Declaration):
+        self.sp_offset -= 4
+        self.symtab[d.var_name] = self.sp_offset
+        if d.value:
+            r = self.visit(d.value)
+            self.emit(f"  sw {r}, {self.sp_offset}(s0)")
+        else:
+            self.emit(f"  sw zero, {self.sp_offset}(s0)")
+
+    def visit_Assignment(self, a: Assignment):
+        """
+        Genera la instrucción sw para
+        - var = expr
+        - arr[idx] = expr
+        (tanto global como local).
+        """
+        # 1) evaluamos el valor a guardar
+        val_reg = self.visit(a.value)
+
+        # 2) ¿es acceso a array?
+        if isinstance(a.var_name, ArrayAccess):
+            arr  = a.var_name.array_name
+            idxr = self.visit(a.var_name.index)
+            addr = self.new_reg()
+
+            # dirección base del array
+            if arr in self.symtab:
+                # array local
+                base_off = self.symtab[arr]
+                self.emit(f"  addi {addr}, s0, {base_off}   # base local {arr}")
+            else:
+                # array global
+                self.emit(f"  la {addr}, {arr}   # base global {arr}")
+
+            # calcular offset = idx * 4
+            tmp = self.new_reg()
+            self.emit(f"  slli {tmp}, {idxr}, 2       # {arr} index*4")
+            self.emit(f"  add {addr}, {addr}, {tmp}   # dirección elemento")
+
+            # almacenar
+            self.emit(f"  sw {val_reg}, 0({addr})   # {arr}[...] = {val_reg}")
+            return
+
+        # 3) asignación a variable normal
+        var_name = a.var_name.name if hasattr(a.var_name, 'name') else a.var_name
+        if var_name in self.symtab:
+            # local / parámetro
+            off = self.symtab[var_name]
+            self.emit(f"  sw {val_reg}, {off}(s0)   # {var_name} = {val_reg}")
+        else:
+            # global
+            self.emit(f"  la t0, {var_name}      # addr {var_name}")
+            self.emit(f"  sw {val_reg}, 0(t0)   # {var_name} = {val_reg}")
+
+    def visit_If(self, node):
+        """Genera código para una sentencia if."""
+        # Obtener etiquetas para saltos
+        L_else = self.new_label()
+        L_end = self.new_label()
+        
+        # Evaluar condición
+        r_cond = self.visit(node.condition)
+        self.emit(f"  beq {r_cond}, zero, {L_else}")
+        
+        # Cuerpo del if (then)
+        if hasattr(node.true_body, 'statements'):
+            # Si es un bloque, visitar sus statements
+            self.visit(node.true_body)
+        elif hasattr(node.true_body, 'children'):
+            # Si es un nodo con children, visitar cada hijo
+            for child in node.true_body.children:
+                self.visit(child)
+        else:
+            # Si es una sentencia simple, visitarla directamente
+            self.visit(node.true_body)
+        
+        # Saltar al final si hay else
+        if node.false_body:
+            self.emit(f"  j {L_end}")
+        
+        # Etiqueta para else
+        self.emit(f"{L_else}:")
+        
+        # Cuerpo del else (opcional)
+        if node.false_body:
+            if hasattr(node.false_body, 'statements'):
+                # Si es un bloque, visitar sus statements
+                self.visit(node.false_body)
+            elif hasattr(node.false_body, 'children'):
+                # Si es un nodo con children, visitar cada hijo
+                for child in node.false_body.children:
+                    self.visit(child)
+            else:
+                # Si es una sentencia simple, visitarla directamente
+                self.visit(node.false_body)
+            
+            # Etiqueta para el final
+            self.emit(f"{L_end}:")
+
+    def visit_While(self, node):
+        """Genera código para una sentencia while."""
+        # Obtener etiquetas para saltos
+        L_start = self.new_label()
+        L_end = self.new_label()
+        
+        # Etiqueta de inicio del bucle
+        self.emit(f"{L_start}:")
+        
+        # Evaluar condición
+        r_cond = self.visit(node.condition)
+        self.emit(f"  beq {r_cond}, zero, {L_end}")
+        
+        # Cuerpo del while
+        if hasattr(node.body, 'statements'):
+            # Si es un bloque, visitar sus statements
+            self.visit(node.body)
+        elif hasattr(node.body, 'children'):
+            # Si es un nodo con children, visitar cada hijo
+            for child in node.body.children:
+                self.visit(child)
+        else:
+            # Si es una sentencia simple, visitarla directamente
+            self.visit(node.body)
+        
+        # Saltar al inicio para evaluar la condición de nuevo
+        self.emit(f"  j {L_start}")
+        
+        # Etiqueta para el final del bucle
+        self.emit(f"{L_end}:")
+
+    def visit_Return(self, node):
+        """Genera código para una sentencia return."""
+        # Extraer la expresión de retorno según el formato del nodo
+        if isinstance(node, dict):
+            expr = node.get('value')
+        else:
+            expr = node.expr if hasattr(node, 'expr') else None
+        
+        # Si hay una expresión de retorno, evaluarla y moverla a a0
+        if expr:
+            try:
+                reg = self.visit(expr)
+                self.emit(f"  mv a0, {reg}   # valor de retorno")
+            except Exception as e:
+                print(f"ERROR en Return: {e}")
+                # Intentamos recuperarnos: si es un Variable, intentar evaluarla directamente
+                if hasattr(expr, 'name') or (isinstance(expr, dict) and 'name' in expr):
+                    var_name = expr.name if hasattr(expr, 'name') else expr.get('name')
+                    if var_name in self.symtab:
+                        off = self.symtab[var_name]
+                        self.emit(f"  lw a0, {off}(s0)  # Recuperación variable {var_name}")
+                    else:
+                        print(f"ERROR: Variable {var_name} no encontrada en symtab: {self.symtab}")
+                        self.emit(f"  li a0, 0  # ERROR: Variable no encontrada")
+        
+        # Salto al epílogo de la función actual
+        self.emit(f"  j .exit_{self.current_function}")
+
+    def visit_BinaryOp(self, b):
+        """Genera código para operaciones binarias."""
+        # Evaluar lado izquierdo y derecho primero
+        lreg = self.visit(b.left)
+        rreg = self.visit(b.right)
+        
+        # Conseguir registro para el resultado
+        result = self.new_reg()
+        
+        # Convertir operadores numéricos a cadenas
+        op = str(b.op) if isinstance(b.op, (int, float)) else b.op
+        
+        # Mapeo de operadores numéricos
+        op_map = {
+            '0': '==', '1': '+', '2': '-', '3': '*', '4': '/',
+            '5': '<', '6': '>', '7': '<=', '8': '>=', '9': '!=',
+            '10': '&&', '11': '||'
+        }
+        
+        # Si es un número como string, convertirlo a su equivalente
+        if op in op_map:
+            op = op_map[op]
+        
+        # Operaciones aritméticas
+        if op == '+':
+            self.emit(f"  add {result}, {lreg}, {rreg}")
+        elif op == '-':
+            self.emit(f"  sub {result}, {lreg}, {rreg}")
+        elif op == '*':
+            self.emit(f"  mul {result}, {lreg}, {rreg}")
+        elif op == '/':
+            self.emit(f"  div {result}, {lreg}, {rreg}")
+        # Operaciones de comparación
+        elif op == '==' or op == '0':
+            self.emit(f"  xor {result}, {lreg}, {rreg}")
+            self.emit(f"  seqz {result}, {result}")
+        elif op == '!=' or op == '9':
+            self.emit(f"  xor {result}, {lreg}, {rreg}")
+            self.emit(f"  snez {result}, {result}")
+        elif op == '<' or op == '5':
+            self.emit(f"  slt {result}, {lreg}, {rreg}")
+        elif op == '<=' or op == '7':
+            self.emit(f"  sgt {result}, {lreg}, {rreg}")
+            self.emit(f"  xori {result}, {result}, 1")
+        elif op == '>' or op == '6':
+            self.emit(f"  sgt {result}, {lreg}, {rreg}")
+        elif op == '>=' or op == '8':
+            self.emit(f"  slt {result}, {lreg}, {rreg}")
+            self.emit(f"  xori {result}, {result}, 1")
+        # Operaciones lógicas
+        elif op == '&&' or op == '10':
+            self.emit(f"  snez {result}, {lreg}")
+            temp = self.new_reg()
+            self.emit(f"  snez {temp}, {rreg}")
+            self.emit(f"  and {result}, {result}, {temp}")
+        elif op == '||' or op == '11':
+            self.emit(f"  or {result}, {lreg}, {rreg}")
+            self.emit(f"  snez {result}, {result}")
+        else:
+            print(f"ADVERTENCIA: Operador desconocido '{op}', tratando como suma")
+            self.emit(f"  add {result}, {lreg}, {rreg}")
+        
+        return result
+
+    def visit_Number(self, n: Number):
+        r = self.new_reg()
+        self.emit(f"  li {r}, {n.value}")
+        return r
+
+    def visit_Variable(self, node):
+        """Genera código para acceder a una variable."""
+        # Extraer el nombre de la variable según el formato del nodo
+        if isinstance(node, dict):
+            var_name = node.get('name')
+        else:
+            var_name = node.name
+        
+        # Obtener un registro para el resultado
+        r = self.new_reg()
+        
+        # Verificar si la variable existe en la tabla de símbolos
+        if var_name not in self.symtab:
+            print(f"ERROR: Variable '{var_name}' no encontrada en la tabla de símbolos: {self.symtab}")
+            self.emit(f"  li {r}, 0  # ERROR: Variable {var_name} no encontrada, usando 0")
+            return r
+        
+        # Cargar el valor de la variable desde su offset en el stack
+        off = self.symtab[var_name]
+        self.emit(f"  lw {r}, {off}(s0)  # carga {var_name}")
+        return r
+
+    def visit_FuncCall(self, node):
+        """Genera código para una llamada a función."""
+        # Extraer nombre y argumentos según el formato del nodo
+        if isinstance(node, dict):
+            func_name = node.get('name')
+            args = node.get('args', [])
+        else:
+            func_name = node.name
+            args = node.args
+        
+        # Evaluar y mover cada argumento a los registros a0-a7
+        for i, arg in enumerate(args):
+            areg = self.visit(arg)
+            self.emit(f"  mv a{i}, {areg}   # arg {i}")
+        
+        # Llamar a la función
+        self.emit(f"  call {func_name}")
+        
+        # Mover el resultado (a0) a un registro temporal
+        ret = self.new_reg()
+        self.emit(f"  mv {ret}, a0   # resultado de {func_name}")
+        return ret
+
+    def visit_ArrayAccess(self, node):
+        # Cargar la dirección base del array
+        array_name = node.array_name
+        
+        # Si es un token, obtener su valor
+        if hasattr(array_name, 'value'):
+            array_name = array_name.value
+        
+        # Calcular el índice
+        index_reg = self.visit(node.index)
+        
+        # Obtener un registro para el resultado
+        result_reg = self.new_reg()
+        
+        # Si es una variable global
+        if array_name in self.globals:
+            # Calcular dirección: base_addr + index * 4
+            self.emit(f"  la {result_reg}, {array_name}   # Dirección base del array")
+            temp_reg = self.new_reg()
+            self.emit(f"  slli {temp_reg}, {index_reg}, 2   # Índice * 4 (tamaño de int)")
+            self.emit(f"  add {result_reg}, {result_reg}, {temp_reg}   # Dirección del elemento")
+            
+            # Cargar el valor desde la dirección calculada
+            value_reg = self.new_reg()
+            self.emit(f"  lw {value_reg}, 0({result_reg})   # Cargar valor de {array_name}[{index_reg}]")
+            
+            return value_reg
+        else:
+            # Arrays locales - implementación simplificada
+            print(f"ADVERTENCIA: Acceso a array local no implementado completamente: {array_name}")
+            return self.new_reg()  # Retornar un registro temporal
+
+    def visit_ArrayDeclaration(self, node: ArrayDeclaration):
+        """Reserva espacio en .data para un array global."""
+        name = node.var_name
+        typ  = node.var_type
+        size = node.size
+        self.globals.add(name)
+        self.emit("  .align 2")
+        self.emit(f"  .globl {name}")
+        self.emit(f"  {name}: .space {size * 4}   # array global {typ} {name}[{size}]")
+
+    def visit_MultiDeclaration(self, m: MultiDeclaration):
+        """Maneja declaraciones múltiples de variables"""
+        for var_name in m.var_names:
+            # Similar a visit_Declaration pero sin valor inicial
+            self.sp_offset -= 4
+            self.symtab[var_name] = self.sp_offset
+            self.emit(f"  sw zero, {self.sp_offset}(s0)  # {var_name} = 0 (inicialización)")
+            
+            # Necesitamos también pre-procesar estas declaraciones
+
+    def visit_For(self, node: For):
+        L_cond = self.new_label()
+        L_body = self.new_label()
+        L_end = self.new_label()
+
+        # 1. Inicialización
+        if node.init:
+            self.visit(node.init)
+        
+        self.emit(f"  j {L_cond}")
+
+        # 2. Cuerpo del bucle
+        self.emit(f"{L_body}:")
+        self.visit(node.body)
+
+        # 3. Actualización
+        if node.update:
+            self.visit(node.update)
+        
+        # 4. Comprobación de condición
+        self.emit(f"{L_cond}:")
+        if node.condition:
+            r_cond = self.visit(node.condition)
+            self.emit(f"  bne {r_cond}, zero, {L_body}")
+        else:
+            self.emit(f"  j {L_body}")  # Bucle infinito si no hay condición
+
+        # 5. Fin del bucle
+        self.emit(f"{L_end}:")
