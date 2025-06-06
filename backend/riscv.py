@@ -9,7 +9,7 @@ class RiscVGenerator:
         self.symtab = {}
         self.sp_offset = 0
         self.label_count = 0
-        self.current_function = ""
+        self.current_function = ""  # Inicializar como string vacío
         self.globals = set()  # Para registrar variables globales
         self.has_main = False  # Para verificar si hay una función main
         # Mapeo de registros para seguimiento de variables
@@ -77,18 +77,22 @@ class RiscVGenerator:
         
         # 1) Detectar función main
         for node in items:
-            if (isinstance(node, Function) or (isinstance(node, dict) and node.get('type')=='function')) \
-               and (getattr(node, 'name', node.get('name')) == "main"):
+            if isinstance(node, Function) and node.name == "main":
+                self.has_main = True
+                break
+            elif (isinstance(node, dict) and node.get('type') == 'function' and node.get('name') == "main"):
                 self.has_main = True
                 break
 
         # 2) Sección .data: globals y arrays
         self.emit(".data")
+        self.current_function = ""  # Asegurar que estamos en contexto global
         for node in items:
-            # Procesamos todos los nodos de declaración global
-            if (isinstance(node, ArrayDeclaration) or 
-                isinstance(node, Declaration) or
-                (isinstance(node, dict) and node.get('type') in ('array_declaration', 'declaration'))):
+            # Solo procesar declaraciones globales en esta fase
+            if (isinstance(node, Declaration) or 
+                isinstance(node, ArrayDeclaration) or
+                isinstance(node, MultiDeclaration) or
+                (isinstance(node, dict) and node.get('type') in ('declaration', 'array_declaration', 'multideclaration'))):
                 self.visit(node)
 
         # 3) Sección .text y etiqueta _start
@@ -97,9 +101,12 @@ class RiscVGenerator:
         self.emit("_start:")
         
         # Inicialización de globals (asignaciones top-level)
+        self.current_function = ""  # Asegurar que estamos en contexto global
         for node in items:
-            # Procesamos TODOS los nodos, dejando que visit() decida qué hacer
-            self.visit(node)
+            # Solo procesar asignaciones globales en esta fase
+            if (isinstance(node, Assignment) or
+                (isinstance(node, dict) and node.get('type') == 'assignment')):
+                self.visit(node)
 
         # Llamar a main si existe
         if self.has_main:
@@ -111,11 +118,13 @@ class RiscVGenerator:
 
         # 4) Generar cada función (prólogos, cuerpo y epílogos)
         for node in items:
-            if (isinstance(node, Function) or 
-                (isinstance(node, dict) and node.get('type')=='function')):
+            if isinstance(node, Function):
                 # establecer current_function para los retornos
-                name = node.name if isinstance(node, Function) else node.get('name')
-                self.current_function = name
+                self.current_function = node.name
+                self.visit(node)
+            elif (isinstance(node, dict) and node.get('type') == 'function'):
+                # establecer current_function para los retornos
+                self.current_function = node.get('name', '')
                 self.visit(node)
 
         return "\n".join(self.output)
@@ -178,7 +187,7 @@ class RiscVGenerator:
                     # DEPRECADO: Crear objeto AST temporal (esto debería eliminarse)
                     try:
                         # Intentar adaptar el nodo dict a su equivalente en AST
-                        from frontend.ast_nodes import Declaration, Assignment, If, While, Return, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
+                        from frontend.ast_nodes import Declaration, Assignment, If, While, Return as ReturnNode, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
                         
                         if node['type'] == 'declaration':
                             obj = Declaration(
@@ -193,6 +202,43 @@ class RiscVGenerator:
                                 node.get('value', None)
                             )
                             return getattr(self, method_name)(obj)
+                        elif node['type'] == 'return':
+                            # Manejar return statement
+                            expr = None
+                            if 'children' in node and node['children']:
+                                # Buscar la expresión en los children
+                                for child in node['children']:
+                                    if not isinstance(child, str) and child != ';':
+                                        expr = child
+                                        break
+                            elif 'expression' in node:
+                                expr = node['expression']
+                            
+                            return self.visit_Return(Return(expr))
+                        elif node['type'] == 'multideclaration':
+                            # Manejar declaración múltiple
+                            var_type = node.get('var_type', '')
+                            var_names = node.get('var_names', [])
+                            obj = MultiDeclaration(var_type, var_names)
+                            return self.visit_MultiDeclaration(obj)
+                        elif node['type'] == 'if':
+                            # Para if, crear un objeto If
+                            condition = node['children'][0] if len(node['children']) > 0 else None
+                            true_body = node['children'][1] if len(node['children']) > 1 else None
+                            false_body = node['children'][2] if len(node['children']) > 2 and node['children'][2] is not None else None
+                            from frontend.ast_nodes import If as IfNode
+                            return self.visit_If(IfNode(condition, true_body, false_body))
+                        elif node['type'] == 'while':
+                            # Para while, crear un objeto While
+                            condition = node['children'][0] if len(node['children']) > 0 else None
+                            body = node['children'][1] if len(node['children']) > 1 else None
+                            from frontend.ast_nodes import While as WhileNode
+                            return self.visit_While(WhileNode(condition, body))
+                        elif node['type'] == 'for_init':
+                            # Para for_init, procesar el primer hijo (assignment)
+                            if node['children'] and len(node['children']) > 0:
+                                return self.visit(node['children'][0])
+                            return None
                         else:
                             # Enviar el nodo dict tal cual
                             return getattr(self, method_name)(node)
@@ -210,15 +256,37 @@ class RiscVGenerator:
                 # Convertir Tree.children a una lista normal
                 children = list(node.children)
                 
-                # Para cada hijo en el árbol
-                results = []
-                for child in children:
-                    result = self.visit(child)
-                    if result is not None:
-                        results.append(result)
-                
-                # Retornar el último resultado no-None
-                return results[-1] if results else None
+                # Casos especiales para diferentes tipos de Tree
+                if node.data == 'stmt':
+                    # Para stmt, procesar el primer hijo
+                    if children:
+                        return self.visit(children[0])
+                elif node.data == 'return':
+                    # Para return, crear un objeto Return
+                    expr = None
+                    for child in children:
+                        if not isinstance(child, Token) or child.type != 'SEMICOLON':
+                            expr = child
+                            break
+                    return self.visit_Return(Return(expr))
+                elif node.data == 'if':
+                    # Para if, crear un objeto If
+                    condition = children[0] if len(children) > 0 else None
+                    true_body = children[1] if len(children) > 1 else None
+                    false_body = children[2] if len(children) > 2 and children[2] is not None else None
+                    from frontend.ast_nodes import If as IfNode
+                    return self.visit_If(IfNode(condition, true_body, false_body))
+                elif node.data == 'while':
+                    # Para while, crear un objeto While
+                    condition = children[0] if len(children) > 0 else None
+                    body = children[1] if len(children) > 1 else None
+                    from frontend.ast_nodes import While as WhileNode
+                    return self.visit_While(WhileNode(condition, body))
+                elif node.data == 'for_init':
+                    # Para for_init, procesar el primer hijo (assignment)
+                    if children and len(children) > 0:
+                        return self.visit(children[0])
+                    return None
         
         # Si es un Token, obtén su valor
         if isinstance(node, Token) or (hasattr(node, 'type') and hasattr(node, 'value')):
@@ -348,12 +416,25 @@ class RiscVGenerator:
             self.sp_offset -= 4
             self.symtab[node.var_name] = self.sp_offset
             print(f"REGISTRO: Variable {node.var_name} en offset {self.sp_offset}")
+        # Si es una declaración múltiple, procesar cada variable
+        elif isinstance(node, MultiDeclaration):
+            for var_name in node.var_names:
+                self.sp_offset -= 4
+                self.symtab[var_name] = self.sp_offset
+                print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
         # Compatibilidad temporal con formato dict para declaraciones
         elif isinstance(node, dict) and node.get('type') == 'declaration':
             var_name = node.get('var_name', '')
             self.sp_offset -= 4
             self.symtab[var_name] = self.sp_offset
             print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
+        # Si es una declaración múltiple, procesar cada variable
+        elif isinstance(node, dict) and node.get('type') == 'multideclaration':
+            var_names = node.get('var_names', [])
+            for var_name in var_names:
+                self.sp_offset -= 4
+                self.symtab[var_name] = self.sp_offset
+                print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
         # Si es un if, procesar ambos bloques
         elif isinstance(node, If):
             self.pre_process_declarations(node.true_body)
@@ -390,75 +471,153 @@ class RiscVGenerator:
         self.emit("  # Fin de bloque")
 
     def visit_Declaration(self, d: Declaration):
-        self.sp_offset -= 4
-        self.symtab[d.var_name] = self.sp_offset
+        """Genera código para una declaración de variable"""
+        var_name = d.var_name
+        var_type = d.var_type
         
-        # Comentario sobre la declaración
-        decl_str = f"{d.var_type} {d.var_name}"
-        if d.value:
-            decl_str += f" = <expr>"
-        
-        self.emit(f"  # Declaración: {decl_str}")
-        
-        if d.value:
-            r = self.visit(d.value)
-            self.reg_to_var[r] = d.var_name  # Registrar variable en registro
-            self.emit(f"  sw {r}, {self.sp_offset}(s0)    # Inicializar '{d.var_name}' con valor calculado")
+        # Verificar si estamos dentro de una función o en nivel global
+        if self.current_function == "":
+            # VARIABLE GLOBAL - debe ir en sección .data
+            self.globals.add(var_name)
+            
+            # Generar etiqueta en sección .data
+            if d.value is not None:
+                # Declaración con valor inicial - solo valores inmediatos
+                immediate_val = self._get_immediate_value(d.value)
+                self.emit(f"{var_name}: .word {immediate_val}")
+            else:
+                # Declaración sin valor inicial (inicializar a 0)
+                self.emit(f"{var_name}: .word 0")
+            
+            # Registrar en tabla de símbolos como global
+            self.symtab[var_name] = {'type': 'global', 'label': var_name}
+            
         else:
-            self.emit(f"  sw zero, {self.sp_offset}(s0)   # Inicializar '{d.var_name}' a 0")
+            # VARIABLE LOCAL - debe ir en el stack
+            self.emit(f"  # Declaración: {var_type} {var_name}")
+            self.sp_offset += 4
+            
+            if d.value is not None:
+                # Evaluar la expresión
+                val_reg = self.visit(d.value)
+                self.emit(f"  sw {val_reg}, -{self.sp_offset}(s0)   # Guardar '{var_name}' en stack")
+            else:
+                # Inicializar a cero
+                self.emit(f"  sw zero, -{self.sp_offset}(s0)   # Inicializar '{var_name}' a 0")
+            
+            # Registrar en tabla de símbolos como local
+            self.symtab[var_name] = {'type': 'local', 'offset': -self.sp_offset}
+    
+    def _get_immediate_value(self, expr):
+        """Extrae el valor inmediato de una expresión simple para variables globales"""
+        if isinstance(expr, Number):
+            return expr.value
+        elif isinstance(expr, dict) and expr.get('type') == 'number':
+            return expr.get('value', 0)
+        else:
+            return 0  # Por defecto para expresiones complejas
 
     def visit_Assignment(self, a: Assignment):
-        """
-        Genera la instrucción sw para
-        - var = expr
-        - arr[idx] = expr
-        (tanto global como local).
-        """
-        # Comentario descriptivo sobre la asignación
-        if isinstance(a.var_name, ArrayAccess):
-            target_desc = f"{a.var_name.array_name}[...]"
-        else:
-            target_desc = a.var_name.name if hasattr(a.var_name, 'name') else a.var_name
+        """Genera código para una asignación de variable"""
+        var_name = a.var_name
         
-        self.emit(f"  # Asignación: {target_desc} = <expr>")
-        
-        # 1) evaluamos el valor a guardar
-        val_reg = self.visit(a.value)
-
-        # 2) ¿es acceso a array?
-        if isinstance(a.var_name, ArrayAccess):
-            arr  = a.var_name.array_name
-            idxr = self.visit(a.var_name.index)
-            addr = self.new_reg()
-
-            # dirección base del array
-            if arr in self.symtab:
-                # array local
-                base_off = self.symtab[arr]
-                self.emit(f"  addi {addr}, s0, {base_off}   # Calcular dirección base del array local '{arr}'")
+        # Verificar si es una asignación a un elemento de array
+        if isinstance(var_name, ArrayAccess) or (isinstance(var_name, dict) and var_name.get('type') == 'arrayaccess'):
+            # ASIGNACIÓN A ELEMENTO DE ARRAY
+            if isinstance(var_name, ArrayAccess):
+                array_name = var_name.array_name
+                index_expr = var_name.index
             else:
-                # array global
-                self.emit(f"  la {addr}, {arr}              # Cargar dirección base del array global '{arr}'")
-
-            # calcular offset = idx * 4
-            tmp = self.new_reg()
-            self.emit(f"  slli {tmp}, {idxr}, 2            # Multiplicar índice por 4 (tamaño de int)")
-            self.emit(f"  add {addr}, {addr}, {tmp}        # Calcular dirección final: base + (índice * 4)")
-
-            # almacenar
-            self.emit(f"  sw {val_reg}, 0({addr})          # Almacenar valor en {arr}[<índice>]")
-            return
-
-        # 3) asignación a variable normal
-        var_name = a.var_name.name if hasattr(a.var_name, 'name') else a.var_name
-        if var_name in self.symtab:
-            # local / parámetro
-            off = self.symtab[var_name]
-            self.emit(f"  sw {val_reg}, {off}(s0)          # Guardar valor en variable local '{var_name}'")
+                array_name = var_name.get('array_name', '')
+                index_expr = var_name.get('index', None)
+            
+            self.emit(f"  # Asignación a array: {array_name}[<índice>] = <expr>")
+            
+            # Evaluar la expresión del lado derecho
+            val_reg = self.visit(a.value)
+            
+            # Evaluar el índice
+            index_reg = self.visit(index_expr)
+            
+            # Si es un array global
+            if array_name in self.globals:
+                # Calcular dirección: base_addr + index * 4
+                addr_reg = self.new_reg()
+                self.emit(f"  la {addr_reg}, {array_name}    # Cargar dirección base del array global '{array_name}'")
+                temp_reg = self.new_reg()
+                self.emit(f"  slli {temp_reg}, {index_reg}, 2  # Multiplicar índice por 4 (tamaño de int)")
+                self.emit(f"  add {addr_reg}, {addr_reg}, {temp_reg} # Calcular dirección del elemento")
+                self.emit(f"  sw {val_reg}, 0({addr_reg})  # Guardar valor en {array_name}[<índice>]")
+            else:
+                # Arrays locales (si los hay)
+                if array_name in self.symtab:
+                    if isinstance(self.symtab[array_name], dict):
+                        base_off = self.symtab[array_name].get('offset', 0)
+                    else:
+                        base_off = self.symtab[array_name]
+                    
+                    self.emit(f"# Asignación a array local '{array_name}' en offset {base_off}")
+                    addr_reg = self.new_reg()
+                    self.emit(f"  addi {addr_reg}, s0, {base_off} # Dirección base del array")
+                    
+                    offset_reg = self.new_reg()
+                    self.emit(f"  slli {offset_reg}, {index_reg}, 2 # Convertir índice a bytes (×4)")
+                    self.emit(f"  add {addr_reg}, {addr_reg}, {offset_reg} # Calcular dirección final")
+                    
+                    self.emit(f"  sw {val_reg}, 0({addr_reg}) # Guardar valor en array")
+                else:
+                    # Error: array no declarado
+                    self.emit(f"# ERROR: Array '{array_name}' no encontrado")
+            
+            return val_reg
+        
+        # Si var_name es un string normal, continuar con la lógica original
+        if not isinstance(var_name, str):
+            var_name = str(var_name)
+        
+        # Verificar si la variable es global o local
+        if var_name in self.globals or (var_name in self.symtab and isinstance(self.symtab[var_name], dict) and self.symtab[var_name].get('type') == 'global'):
+            # ASIGNACIÓN A VARIABLE GLOBAL
+            self.emit(f"  # Asignación global: {var_name} = <expr>")
+            
+            # Evaluar la expresión del lado derecho
+            val_reg = self.visit(a.value)
+            
+            # Cargar la dirección de la variable global y guardar el valor
+            addr_reg = self.new_reg()
+            self.emit(f"  la {addr_reg}, {var_name}      # Cargar dirección de variable global '{var_name}'")
+            self.emit(f"  sw {val_reg}, 0({addr_reg})    # Guardar valor en variable global '{var_name}'")
+            
+        elif var_name in self.symtab and isinstance(self.symtab[var_name], dict) and self.symtab[var_name].get('type') == 'local':
+            # ASIGNACIÓN A VARIABLE LOCAL
+            self.emit(f"  # Asignación local: {var_name} = <expr>")
+            
+            # Evaluar la expresión del lado derecho  
+            val_reg = self.visit(a.value)
+            
+            # Obtener offset de la variable local
+            offset = self.symtab[var_name]['offset']
+            self.emit(f"  sw {val_reg}, {offset}(s0)          # Guardar valor en variable local '{var_name}'")
+        elif var_name in self.symtab and isinstance(self.symtab[var_name], int):
+            # ASIGNACIÓN A VARIABLE LOCAL (formato antiguo - entero como offset)
+            self.emit(f"  # Asignación local: {var_name} = <expr>")
+            
+            # Evaluar la expresión del lado derecho  
+            val_reg = self.visit(a.value)
+            
+            # Obtener offset de la variable local
+            offset = self.symtab[var_name]
+            self.emit(f"  sw {val_reg}, {offset}(s0)          # Guardar valor en variable local '{var_name}'")
         else:
-            # global
-            self.emit(f"  la t0, {var_name}                # Cargar dirección de variable global '{var_name}'")
-            self.emit(f"  sw {val_reg}, 0(t0)              # Guardar valor en variable global '{var_name}'")
+            # Si no está en symtab, asumir que es una nueva variable local
+            self.sp_offset += 4
+            offset = -self.sp_offset
+            self.symtab[var_name] = {'type': 'local', 'offset': offset}
+            # Evaluar la expresión del lado derecho  
+            val_reg = self.visit(a.value)
+            self.emit(f"  sw {val_reg}, {offset}(s0)          # Guardar valor en variable local '{var_name}'")
+        
+        return val_reg
 
     def visit_If(self, node):
         """Genera código para una estructura if-else."""
@@ -633,27 +792,37 @@ class RiscVGenerator:
         return r
 
     def visit_Variable(self, node):
-        """Genera código para acceder a una variable."""
-        # Extraer el nombre de la variable según el formato del nodo
-        if isinstance(node, dict):
-            var_name = node.get('name')
-        else:
+        """Genera código para acceder a una variable"""
+        # Extraer el nombre de la variable
+        if isinstance(node, Variable):
             var_name = node.name
+        elif isinstance(node, dict):
+            var_name = node.get('name', '')
+        else:
+            var_name = str(node)
         
-        # Obtener un registro para el resultado
-        r = self.new_reg()
+        reg = self.new_reg()
         
-        # Verificar si la variable existe en la tabla de símbolos
-        if var_name not in self.symtab:
-            print(f"ERROR: Variable '{var_name}' no encontrada en la tabla de símbolos: {self.symtab}")
-            self.emit(f"  li {r}, 0                    # ERROR: Variable '{var_name}' no encontrada, usando 0")
-            return r
+        # Verificar si es variable global o local
+        if var_name in self.globals or (var_name in self.symtab and isinstance(self.symtab[var_name], dict) and self.symtab[var_name].get('type') == 'global'):
+            # VARIABLE GLOBAL
+            self.emit(f"  la {reg}, {var_name}               # Cargar dirección de variable global '{var_name}'")
+            self.emit(f"  lw {reg}, 0({reg})                # Cargar valor de variable global '{var_name}'")
+        elif var_name in self.symtab and isinstance(self.symtab[var_name], dict) and 'offset' in self.symtab[var_name]:
+            # VARIABLE LOCAL (formato nuevo)
+            offset = self.symtab[var_name]['offset']
+            self.emit(f"  lw {reg}, {offset}(s0)               # Cargar valor de variable local '{var_name}'")
+        elif var_name in self.symtab and isinstance(self.symtab[var_name], int):
+            # VARIABLE LOCAL (formato antiguo - entero como offset)
+            offset = self.symtab[var_name]
+            self.emit(f"  lw {reg}, {offset}(s0)               # Cargar valor de variable local '{var_name}'")
+        else:
+            # Variable no declarada - marcar error pero generar código válido
+            self.has_errors = True
+            self.emit(f"  # ERROR: Variable '{var_name}' no declarada")
+            self.emit(f"  li {reg}, 0                       # Valor por defecto para variable no declarada")
         
-        # Cargar el valor de la variable desde su offset en el stack
-        off = self.symtab[var_name]
-        self.emit(f"  lw {r}, {off}(s0)               # Cargar valor de variable '{var_name}'")
-        self.reg_to_var[r] = var_name  # Registrar qué variable está en este registro
-        return r
+        return reg
 
     def visit_FuncCall(self, node):
         """Genera código para una llamada a función."""
@@ -759,12 +928,27 @@ class RiscVGenerator:
 
     def visit_MultiDeclaration(self, m: MultiDeclaration):
         """Maneja declaraciones múltiples de variables"""
-        self.emit(f"# Declaración múltiple: {m.var_type} {', '.join(m.var_names)}")
-        for var_name in m.var_names:
-            # Similar a visit_Declaration pero sin valor inicial
-            self.sp_offset -= 4
-            self.symtab[var_name] = self.sp_offset
-            self.emit(f"  sw zero, {self.sp_offset}(s0)  # Inicializar '{var_name}' a 0")
+        self.emit(f"  # Declaración múltiple: {m.var_type} {', '.join(m.var_names)}")
+        
+        # Si estamos en una función, las variables ya fueron registradas en pre_process_declarations
+        # Solo necesitamos inicializarlas a 0
+        if self.current_function != "":
+            for var_name in m.var_names:
+                if var_name in self.symtab:
+                    if isinstance(self.symtab[var_name], int):
+                        # Formato antiguo
+                        offset = self.symtab[var_name]
+                        self.emit(f"  sw zero, {offset}(s0)  # Inicializar '{var_name}' a 0")
+                    elif isinstance(self.symtab[var_name], dict) and 'offset' in self.symtab[var_name]:
+                        # Formato nuevo
+                        offset = self.symtab[var_name]['offset']
+                        self.emit(f"  sw zero, {offset}(s0)  # Inicializar '{var_name}' a 0")
+        else:
+            # Variables globales
+            for var_name in m.var_names:
+                self.globals.add(var_name)
+                self.emit(f"{var_name}: .word 0")
+                self.symtab[var_name] = {'type': 'global', 'label': var_name}
 
     def visit_For(self, node: For):
         L_cond = self.new_label()
@@ -790,7 +974,16 @@ class RiscVGenerator:
         self.emit(f"{L_update}:                        # Actualización del bucle for")
         if node.update:
             self.emit(f"# Actualización del bucle for")
-            self.visit(node.update)
+            # Manejar diferentes tipos de update
+            if isinstance(node.update, str):
+                # Si es un string como "i", crear una asignación i = i + 1
+                from frontend.ast_nodes import Assignment, Variable, BinaryOp, Number
+                update_expr = BinaryOp('+', Variable(node.update), Number(1))
+                update_stmt = Assignment(node.update, update_expr)
+                self.visit(update_stmt)
+            else:
+                # Si es una expresión o statement, visitarlo directamente
+                self.visit(node.update)
         
         # 4. Comprobación de condición
         self.emit(f"{L_cond}:                          # Evaluación de condición del bucle for")

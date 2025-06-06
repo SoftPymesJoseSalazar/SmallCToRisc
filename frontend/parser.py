@@ -121,7 +121,21 @@ COMMENT: /\/\/[^\n]*/ | /\/\*.*?\*\//
 @v_args(inline=True)
 class ASTTransformer(Transformer):
     def start(self, *items):
-        return Program([i for i in items if i is not None])
+        # Aplanar todos los elementos de nivel superior
+        flattened_items = []
+        for item in items:
+            if item is not None:
+                flattened_items.append(item)
+        
+        return Program(flattened_items)
+
+    def top_level(self, item):
+        """Simplemente retorna el item sin envoltorio adicional"""
+        return item
+    
+    def global_decl(self, item):
+        """Simplemente retorna el item sin envoltorio adicional"""
+        return item
 
     def function(self, ret, name, params, body):
         """Transforma una declaración de función en un nodo Function."""
