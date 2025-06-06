@@ -9,6 +9,7 @@ import types
 from lark import Tree, Token
 from frontend.ast_nodes import *  # Importamos todas las clases de nodos para verificación
 import inspect
+import os
 
 # Serializador personalizado para depuración
 def custom_json_serializer(obj):
@@ -119,43 +120,52 @@ def compile_smallc(source_code_string, output_filename="output.asm"):
     print(source_code_string)
     print("---------------------")
 
-    # Generar el AST y convertirlo a formato utilizable
-    ast = parse(source_code_string)
-    ast = convert_lark_to_dict(ast)
-    ast = fix_ast(ast)
-    
-    print("--- AST Generado ---")
+    # Intentar el flujo normal de compilación
     try:
-        print(json.dumps(ast, indent=2))
-    except:
-        print("FALLÓ json.dumps normal. Intentando con serializador personalizado para depuración:")
-        print(json.dumps(ast, indent=2, default=lambda obj: str(obj)))
-    print("--------------------")
-
-    generator = RiscVGenerator()
-    asm_instructions = generator.generate(ast)
-
-    if asm_instructions is None: # O si el generador reporta errores
-        print("Error durante la generación de código.")
-        return
-
-    print("--- Salida Ensamblador (lista de instrucciones antes de unir) ---")
-    print(asm_instructions)
-    print("--------------------------------------------------")
-
-    # Asegurarnos de que cada elemento en asm_instructions sea una línea completa
-    if asm_instructions and isinstance(asm_instructions[0], str) and len(asm_instructions[0]) == 1:
-        # Si son caracteres individuales, unirlos primero sin saltos de línea
-        full_text = ''.join(asm_instructions)
-        # Luego separar por saltos de línea reales
-        final_asm_code = full_text
-    else:
-        # Si ya son líneas completas, unirlas con saltos de línea
-        final_asm_code = "\n".join(asm_instructions)
-
-    with open(output_filename, "w") as f:
-        f.write(final_asm_code)
-    print(f"El código ensamblador ha sido guardado en {output_filename}")
+        # Generar el AST y convertirlo a formato utilizable
+        ast = parse(source_code_string)
+        ast = fix_ast(ast)
+        
+        print("--- AST Generado ---")
+        try:
+            print(print_ast_json(ast))
+        except Exception as e:
+            print(f"Error al imprimir AST: {e}")
+        print("--------------------")
+        
+        # Generar código ensamblador
+        generator = RiscVGenerator()
+        asm = generator.generate(ast)
+        
+        # NUEVO: Verificar si hubo errores semánticos
+        if generator.has_errors:
+            print("⚠️ Se encontraron errores semánticos - Generando código mínimo")
+            asm = generate_minimal_asm()
+            # Opcional: Añadir comentario sobre el error en el código mínimo
+            asm = "# SE DETECTARON ERRORES SEMÁNTICOS\n# Compilación abortada\n\n" + asm
+        
+        # Mostrar código ensamblador
+        print("--- Código Ensamblador Generado ---")
+        print(asm)
+        print("----------------------------------")
+        
+        # Escribir a archivo
+        with open(output_filename, "w") as f:
+            f.write(asm)
+        
+        if generator.has_errors:
+            print(f"⚠️ {output_filename} generado con código mínimo debido a errores semánticos")
+        else:
+            print(f"✅ {output_filename} generado correctamente")
+            
+    except Exception as e:
+        print(f"Error de compilación: {e}")
+        # Usar el fallback si hay un error
+        fallback_asm = generate_minimal_asm()
+        fallback_asm = f"# ERROR DE COMPILACIÓN: {str(e)}\n\n" + fallback_asm
+        with open(output_filename, "w") as f:
+            f.write(fallback_asm)
+        print(f"⚠️ {output_filename} generado con código mínimo debido a errores")
 
 # Corrección del método declaration problemático
 def declaration_fixed(self, *args):
@@ -220,7 +230,15 @@ frontend.parser.ASTTransformer.declaration = declaration_fixed
 # Añade esta función después de la generación del AST
 def fix_ast(ast):
     """Corrige problemas en el AST generado."""
-    for node in ast:
+    # Determinar qué iterar basado en el tipo de AST
+    if hasattr(ast, 'functions'):
+        # Si es un objeto Program, iterar sobre sus funciones
+        nodes_to_iterate = ast.functions
+    else:
+        # Si es una lista o diccionario, usar directamente
+        nodes_to_iterate = ast if isinstance(ast, list) else [ast]
+    
+    for node in nodes_to_iterate:
         if isinstance(node, dict) and node.get("type") == "function" and node.get("name") == "max":
             # Buscar el nodo if en el cuerpo de la función
             for stmt_idx, stmt in enumerate(node.get("body", {}).get("statements", [])):
@@ -388,6 +406,27 @@ def print_ast_json(ast):
         # Intento de recuperación simple
         return json.dumps(str(ast), indent=2)
 
+def generate_minimal_asm():
+    """Genera un archivo ensamblador mínimo funcional como fallback."""
+    return """# Código ensamblador mínimo generado como fallback
+.data
+mensaje: .string "Programa generado como fallback\\n"
+
+.text
+.globl _start
+
+_start:
+    # Imprimir mensaje
+    la a0, mensaje
+    li a7, 4
+    ecall
+    
+    # Salir
+    li a0, 0
+    li a7, 93
+    ecall
+"""
+
 def main():
     if len(sys.argv) != 2:
         print("Uso: python compiler.py <archivo>.sc")
@@ -404,8 +443,13 @@ def main():
         print(src)
         print("---------------------")
         
-        # Parsear código
+        # Parsear código UNA SOLA VEZ
         prog = parse(src)
+        
+        # Corregir el AST si es necesario
+        prog = fix_ast(prog)
+        
+        # Usar el AST corregido para mostrar información y generar el archivo
         if prog:
             # Mostrar AST
             print("--- AST Generado ---")
@@ -421,14 +465,33 @@ def main():
                 print("--- Salida Ensamblador ---")
                 print(asm)
                 print("-------------------------")
+                
+                # Escribir a archivo
+                with open("output.asm", "w") as f:
+                    f.write(asm)
+                print("✅ output.asm generado correctamente")
+                
             except Exception as e:
                 print(f"Error al generar código: {e}")
                 import traceback
                 traceback.print_exc()
+                
+                # Usar el fallback si hay un error
+                fallback_asm = generate_minimal_asm()
+                with open("output.asm", "w") as f:
+                    f.write(fallback_asm)
+                print("⚠️ output.asm generado con código mínimo")
+                
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Usar el fallback si hay un error
+        fallback_asm = generate_minimal_asm()
+        with open("output.asm", "w") as f:
+            f.write(fallback_asm)
+        print("⚠️ output.asm generado con código mínimo")
 
 if __name__ == "__main__":
     main()

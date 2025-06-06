@@ -101,4 +101,8 @@ class MultiDeclaration:
     """Representa una declaración múltiple de variables"""
     def __init__(self, var_type, var_names):
         self.var_type = var_type
-        self.var_names = var_names  # Lista de nombres de variables 
+        self.var_names = var_names  # Lista de nombres de variables
+
+@dataclass
+class String(Expression):
+    value: str 

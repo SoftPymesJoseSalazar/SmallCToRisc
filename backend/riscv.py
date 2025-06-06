@@ -12,6 +12,12 @@ class RiscVGenerator:
         self.current_function = ""
         self.globals = set()  # Para registrar variables globales
         self.has_main = False  # Para verificar si hay una función main
+        # Mapeo de registros para seguimiento de variables
+        self.reg_to_var = {}  # Registra qué variable está en qué registro
+        
+        # Nueva adición: Tabla de símbolos para funciones declaradas
+        self.declared_functions = set()
+        self.has_errors = False  # Indicador de errores semánticos
 
     def new_reg(self):
         r = self.regs[self.reg_idx]
@@ -55,6 +61,20 @@ class RiscVGenerator:
             raw = []
         items = self._flatten(raw)
 
+        # NUEVO: Primera pasada para recopilar todas las funciones declaradas
+        self.declared_functions = set()
+        for node in items:
+            if isinstance(node, Function):
+                self.declared_functions.add(node.name)
+            elif isinstance(node, dict) and node.get('type') == 'function':
+                self.declared_functions.add(node.get('name'))
+        
+        # Añadir funciones intrínsecas/de biblioteca si es necesario
+        self.declared_functions.add("print")  # Ejemplo de función intrínseca
+        self.declared_functions.add("exit")   # Ejemplo de función intrínseca
+        
+        # Resto del código de generación si no hay errores semánticos
+        
         # 1) Detectar función main
         for node in items:
             if (isinstance(node, Function) or (isinstance(node, dict) and node.get('type')=='function')) \
@@ -84,8 +104,8 @@ class RiscVGenerator:
         # Llamar a main si existe
         if self.has_main:
             self.emit("  call main")
+            # El valor de retorno de main debería estar en a0
         # Exit syscall
-        self.emit("  li a0, 0")
         self.emit("  li a7, 93")
         self.emit("  ecall")
 
@@ -243,8 +263,8 @@ class RiscVGenerator:
         self.reg_idx = 0
         self.current_function = fn_name
         
-        # Depuración: mostrar parámetros recibidos
-        print(f"DEBUG: Función {fn_name} con parámetros: {fn_params}")
+        # Comentario descriptivo sobre la función
+        self.emit(f"# ====== FUNCIÓN: {fn_name}({', '.join([p.param_type + ' ' + p.name if isinstance(p, Parameter) else 'param' for p in fn_params])}) ======")
         
         # Cabecera de función
         self.emit(f".globl {fn_name}")
@@ -271,9 +291,6 @@ class RiscVGenerator:
         # CORRECCIÓN: Inicializar sp_offset para que comience DESPUÉS de los parámetros
         self.sp_offset = last_param_offset
         
-        # Depuración: mostrar tabla de símbolos después de registrar parámetros
-        print(f"DEBUG: SYMTAB inicial para {fn_name}: {self.symtab}")
-        
         # Pre-procesar declaraciones para reservar espacio
         required_locals_space = self.pre_process_declarations(fn_body)
         
@@ -283,30 +300,34 @@ class RiscVGenerator:
         frame_size = total_locals_space + saved_regs_space
         frame_size = (frame_size + 15) & ~15  # Alinear a 16 bytes
         
-        # Prólogo - reservar espacio para variables locales y registros salvados
-        self.emit(f"  addi sp, sp, -{frame_size}")
-        self.emit(f"  sw ra, {frame_size-4}(sp)")
-        self.emit(f"  sw s0, {frame_size-8}(sp)")
-        self.emit(f"  addi s0, sp, {frame_size}")  # s0 apunta al antiguo sp
+        # Prólogo con comentarios detallados
+        self.emit(f"# ----- Prólogo de función '{fn_name}' -----")
+        self.emit(f"# Reservar frame de {frame_size} bytes: {total_locals_space} para variables locales + {saved_regs_space} para registros salvados")
+        self.emit(f"  addi sp, sp, -{frame_size}  # Expandir stack frame")
+        self.emit(f"  sw ra, {frame_size-4}(sp)   # Guardar dirección de retorno")
+        self.emit(f"  sw s0, {frame_size-8}(sp)   # Guardar frame pointer anterior")
+        self.emit(f"  addi s0, sp, {frame_size}   # Establecer nuevo frame pointer")
         
         # Ahora transferimos los argumentos desde a0-aN a sus posiciones en el stack
+        if fn_params:
+            self.emit(f"# Copiar argumentos de registros a0-a{len(fn_params)-1} a stack frame")
         for i, p in enumerate(fn_params):
             param_name = p.name if isinstance(p, Parameter) else f"param{i}"
             off = self.symtab[param_name]
-            self.emit(f"  sw a{i}, {off}(s0)   # param {param_name}")
-        
-        # Depuración: mostrar tabla de símbolos después de pre-procesar
-        print(f"DEBUG: SYMTAB final para {fn_name}: {self.symtab}")
+            self.emit(f"  sw a{i}, {off}(s0)      # Guardar parámetro '{param_name}' en stack")
         
         # Visitar el cuerpo de la función
+        self.emit(f"# ----- Cuerpo de función '{fn_name}' -----")
         self.visit(fn_body)
         
-        # Epílogo
+        # Epílogo con comentarios detallados
+        self.emit(f"# ----- Epílogo de función '{fn_name}' -----")
         self.emit(f".exit_{fn_name}:")
-        self.emit(f"  lw s0, {frame_size-8}(sp)")
-        self.emit(f"  lw ra, {frame_size-4}(sp)")
-        self.emit(f"  addi sp, sp, {frame_size}")
-        self.emit("  ret")
+        self.emit(f"  lw s0, {frame_size-8}(sp)   # Restaurar frame pointer anterior")
+        self.emit(f"  lw ra, {frame_size-4}(sp)   # Restaurar dirección de retorno")
+        self.emit(f"  addi sp, sp, {frame_size}   # Liberar stack frame ({frame_size} bytes)")
+        self.emit("  ret                       # Retornar al llamador")
+        self.emit(f"# ====== FIN FUNCIÓN {fn_name} ======\n")
 
     def pre_process_declarations(self, node):
         """Procesa todas las declaraciones en un bloque primero para registrarlas en la tabla de símbolos.
@@ -363,17 +384,28 @@ class RiscVGenerator:
         return abs(self.sp_offset - initial_sp_offset)
 
     def visit_Block(self, blk: Block):
+        self.emit("  # Inicio de bloque")
         for stmt in blk.statements:
             self.visit(stmt)
+        self.emit("  # Fin de bloque")
 
     def visit_Declaration(self, d: Declaration):
         self.sp_offset -= 4
         self.symtab[d.var_name] = self.sp_offset
+        
+        # Comentario sobre la declaración
+        decl_str = f"{d.var_type} {d.var_name}"
+        if d.value:
+            decl_str += f" = <expr>"
+        
+        self.emit(f"  # Declaración: {decl_str}")
+        
         if d.value:
             r = self.visit(d.value)
-            self.emit(f"  sw {r}, {self.sp_offset}(s0)")
+            self.reg_to_var[r] = d.var_name  # Registrar variable en registro
+            self.emit(f"  sw {r}, {self.sp_offset}(s0)    # Inicializar '{d.var_name}' con valor calculado")
         else:
-            self.emit(f"  sw zero, {self.sp_offset}(s0)")
+            self.emit(f"  sw zero, {self.sp_offset}(s0)   # Inicializar '{d.var_name}' a 0")
 
     def visit_Assignment(self, a: Assignment):
         """
@@ -382,6 +414,14 @@ class RiscVGenerator:
         - arr[idx] = expr
         (tanto global como local).
         """
+        # Comentario descriptivo sobre la asignación
+        if isinstance(a.var_name, ArrayAccess):
+            target_desc = f"{a.var_name.array_name}[...]"
+        else:
+            target_desc = a.var_name.name if hasattr(a.var_name, 'name') else a.var_name
+        
+        self.emit(f"  # Asignación: {target_desc} = <expr>")
+        
         # 1) evaluamos el valor a guardar
         val_reg = self.visit(a.value)
 
@@ -395,18 +435,18 @@ class RiscVGenerator:
             if arr in self.symtab:
                 # array local
                 base_off = self.symtab[arr]
-                self.emit(f"  addi {addr}, s0, {base_off}   # base local {arr}")
+                self.emit(f"  addi {addr}, s0, {base_off}   # Calcular dirección base del array local '{arr}'")
             else:
                 # array global
-                self.emit(f"  la {addr}, {arr}   # base global {arr}")
+                self.emit(f"  la {addr}, {arr}              # Cargar dirección base del array global '{arr}'")
 
             # calcular offset = idx * 4
             tmp = self.new_reg()
-            self.emit(f"  slli {tmp}, {idxr}, 2       # {arr} index*4")
-            self.emit(f"  add {addr}, {addr}, {tmp}   # dirección elemento")
+            self.emit(f"  slli {tmp}, {idxr}, 2            # Multiplicar índice por 4 (tamaño de int)")
+            self.emit(f"  add {addr}, {addr}, {tmp}        # Calcular dirección final: base + (índice * 4)")
 
             # almacenar
-            self.emit(f"  sw {val_reg}, 0({addr})   # {arr}[...] = {val_reg}")
+            self.emit(f"  sw {val_reg}, 0({addr})          # Almacenar valor en {arr}[<índice>]")
             return
 
         # 3) asignación a variable normal
@@ -414,56 +454,46 @@ class RiscVGenerator:
         if var_name in self.symtab:
             # local / parámetro
             off = self.symtab[var_name]
-            self.emit(f"  sw {val_reg}, {off}(s0)   # {var_name} = {val_reg}")
+            self.emit(f"  sw {val_reg}, {off}(s0)          # Guardar valor en variable local '{var_name}'")
         else:
             # global
-            self.emit(f"  la t0, {var_name}      # addr {var_name}")
-            self.emit(f"  sw {val_reg}, 0(t0)   # {var_name} = {val_reg}")
+            self.emit(f"  la t0, {var_name}                # Cargar dirección de variable global '{var_name}'")
+            self.emit(f"  sw {val_reg}, 0(t0)              # Guardar valor en variable global '{var_name}'")
 
     def visit_If(self, node):
-        """Genera código para una sentencia if."""
-        # Obtener etiquetas para saltos
+        """Genera código para una estructura if-else."""
+        # Generar etiquetas para los bloques
         L_else = self.new_label()
         L_end = self.new_label()
         
-        # Evaluar condición
+        # Comentario descriptivo
+        self.emit(f"  # ----- Estructura if-else -----")
+        
+        # 1. Evaluar la condición
+        self.emit(f"  # Evaluación de condición if")
         r_cond = self.visit(node.condition)
-        self.emit(f"  beq {r_cond}, zero, {L_else}")
         
-        # Cuerpo del if (then)
-        if hasattr(node.true_body, 'statements'):
-            # Si es un bloque, visitar sus statements
-            self.visit(node.true_body)
-        elif hasattr(node.true_body, 'children'):
-            # Si es un nodo con children, visitar cada hijo
-            for child in node.true_body.children:
-                self.visit(child)
+        # 2. Instrucción de salto condicional - SOLUCIÓN DEL BUG
+        # Si la condición es falsa (r_cond == 0), saltar al bloque else o al final
+        if node.false_body:
+            self.emit(f"  beq {r_cond}, zero, {L_else}  # Si condición es falsa, saltar a 'else'")
         else:
-            # Si es una sentencia simple, visitarla directamente
-            self.visit(node.true_body)
+            self.emit(f"  beq {r_cond}, zero, {L_end}   # Si condición es falsa, saltar al final")
         
-        # Saltar al final si hay else
+        # 3. Generar código para el bloque "then"
+        self.emit(f"  # Inicio bloque 'then'")
+        self.visit(node.true_body)
+        
+        # 4. Si hay un bloque "else", agregar salto para evitar su ejecución - SOLUCIÓN DEL BUG
         if node.false_body:
-            self.emit(f"  j {L_end}")
+            self.emit(f"  j {L_end}                    # Saltar al final después de ejecutar 'then'")
+            self.emit(f"{L_else}:                      # Etiqueta para bloque 'else'")
+            self.emit(f"  # Inicio bloque 'else'")
+            self.visit(node.false_body)
         
-        # Etiqueta para else
-        self.emit(f"{L_else}:")
-        
-        # Cuerpo del else (opcional)
-        if node.false_body:
-            if hasattr(node.false_body, 'statements'):
-                # Si es un bloque, visitar sus statements
-                self.visit(node.false_body)
-            elif hasattr(node.false_body, 'children'):
-                # Si es un nodo con children, visitar cada hijo
-                for child in node.false_body.children:
-                    self.visit(child)
-            else:
-                # Si es una sentencia simple, visitarla directamente
-                self.visit(node.false_body)
-            
-            # Etiqueta para el final
-            self.emit(f"{L_end}:")
+        # 5. Etiqueta de fin de la estructura if-else
+        self.emit(f"{L_end}:                        # Fin de estructura if-else")
+        self.emit(f"  # ----- Fin estructura if-else -----")
 
     def visit_While(self, node):
         """Genera código para una sentencia while."""
@@ -471,14 +501,19 @@ class RiscVGenerator:
         L_start = self.new_label()
         L_end = self.new_label()
         
+        # Comentario descriptivo del bucle while
+        self.emit(f"  # ----- Inicio de bucle while -----")
+        
         # Etiqueta de inicio del bucle
-        self.emit(f"{L_start}:")
+        self.emit(f"{L_start}:                              # Inicio de la evaluación de condición while")
         
         # Evaluar condición
+        self.emit(f"  # Evaluar condición del bucle")
         r_cond = self.visit(node.condition)
-        self.emit(f"  beq {r_cond}, zero, {L_end}")
+        self.emit(f"  beq {r_cond}, zero, {L_end}          # Si condición es falsa, salir del bucle")
         
         # Cuerpo del while
+        self.emit(f"  # Cuerpo del bucle while")
         if hasattr(node.body, 'statements'):
             # Si es un bloque, visitar sus statements
             self.visit(node.body)
@@ -491,43 +526,36 @@ class RiscVGenerator:
             self.visit(node.body)
         
         # Saltar al inicio para evaluar la condición de nuevo
-        self.emit(f"  j {L_start}")
+        self.emit(f"  j {L_start}                         # Volver al inicio para reevaluar condición")
         
         # Etiqueta para el final del bucle
-        self.emit(f"{L_end}:")
+        self.emit(f"{L_end}:                              # Fin del bucle while")
+        self.emit(f"  # ----- Fin de bucle while -----")
 
     def visit_Return(self, node):
         """Genera código para una sentencia return."""
-        # Extraer la expresión de retorno según el formato del nodo
-        if isinstance(node, dict):
-            expr = node.get('value')
+        self.emit(f"  # ----- Return statement -----")
+        
+        # 1. Evaluar la expresión de retorno (si existe)
+        if node.expr:
+            self.emit(f"  # Evaluar expresión de retorno")
+            reg_result = self.visit(node.expr)
+            
+            # 2. Mover el resultado a a0 (registro de valor de retorno) - SOLUCIÓN DEL BUG
+            self.emit(f"  mv a0, {reg_result}           # Colocar valor de retorno en a0")
         else:
-            expr = node.expr if hasattr(node, 'expr') else None
+            # Si no hay expresión, retornar 0 por defecto
+            self.emit(f"  li a0, 0                    # Return sin valor (default 0)")
         
-        # Si hay una expresión de retorno, evaluarla y moverla a a0
-        if expr:
-            try:
-                reg = self.visit(expr)
-                self.emit(f"  mv a0, {reg}   # valor de retorno")
-            except Exception as e:
-                print(f"ERROR en Return: {e}")
-                # Intentamos recuperarnos: si es un Variable, intentar evaluarla directamente
-                if hasattr(expr, 'name') or (isinstance(expr, dict) and 'name' in expr):
-                    var_name = expr.name if hasattr(expr, 'name') else expr.get('name')
-                    if var_name in self.symtab:
-                        off = self.symtab[var_name]
-                        self.emit(f"  lw a0, {off}(s0)  # Recuperación variable {var_name}")
-                    else:
-                        print(f"ERROR: Variable {var_name} no encontrada en symtab: {self.symtab}")
-                        self.emit(f"  li a0, 0  # ERROR: Variable no encontrada")
-        
-        # Salto al epílogo de la función actual
-        self.emit(f"  j .exit_{self.current_function}")
+        # 3. Saltar al epílogo de la función - SOLUCIÓN DEL BUG
+        self.emit(f"  j .exit_{self.current_function}  # Saltar al epílogo de la función")
 
     def visit_BinaryOp(self, b):
         """Genera código para operaciones binarias."""
         # Evaluar lado izquierdo y derecho primero
+        self.emit(f"  # Evaluar operando izquierdo")
         lreg = self.visit(b.left)
+        self.emit(f"  # Evaluar operando derecho")
         rreg = self.visit(b.right)
         
         # Conseguir registro para el resultado
@@ -547,50 +575,61 @@ class RiscVGenerator:
         if op in op_map:
             op = op_map[op]
         
+        # Descripción legible de la operación
+        op_desc = {
+            '+': 'suma', '-': 'resta', '*': 'multiplicación', '/': 'división',
+            '==': 'igualdad', '!=': 'desigualdad', 
+            '<': 'menor que', '>': 'mayor que', 
+            '<=': 'menor o igual que', '>=': 'mayor o igual que',
+            '&&': 'AND lógico', '||': 'OR lógico'
+        }.get(op, op)
+        
+        self.emit(f"  # Operación binaria: {op_desc}")
+        
         # Operaciones aritméticas
         if op == '+':
-            self.emit(f"  add {result}, {lreg}, {rreg}")
+            self.emit(f"  add {result}, {lreg}, {rreg}      # {result} = {lreg} + {rreg}")
         elif op == '-':
-            self.emit(f"  sub {result}, {lreg}, {rreg}")
+            self.emit(f"  sub {result}, {lreg}, {rreg}      # {result} = {lreg} - {rreg}")
         elif op == '*':
-            self.emit(f"  mul {result}, {lreg}, {rreg}")
+            self.emit(f"  mul {result}, {lreg}, {rreg}      # {result} = {lreg} * {rreg}")
         elif op == '/':
-            self.emit(f"  div {result}, {lreg}, {rreg}")
+            self.emit(f"  div {result}, {lreg}, {rreg}      # {result} = {lreg} / {rreg}")
         # Operaciones de comparación
         elif op == '==' or op == '0':
-            self.emit(f"  xor {result}, {lreg}, {rreg}")
-            self.emit(f"  seqz {result}, {result}")
+            self.emit(f"  xor {result}, {lreg}, {rreg}      # XOR para comparar bits")
+            self.emit(f"  seqz {result}, {result}           # {result} = 1 si {lreg} == {rreg}, 0 en caso contrario")
         elif op == '!=' or op == '9':
-            self.emit(f"  xor {result}, {lreg}, {rreg}")
-            self.emit(f"  snez {result}, {result}")
+            self.emit(f"  xor {result}, {lreg}, {rreg}      # XOR para comparar bits")
+            self.emit(f"  snez {result}, {result}           # {result} = 1 si {lreg} != {rreg}, 0 en caso contrario")
         elif op == '<' or op == '5':
-            self.emit(f"  slt {result}, {lreg}, {rreg}")
+            self.emit(f"  slt {result}, {lreg}, {rreg}      # {result} = 1 si {lreg} < {rreg}, 0 en caso contrario")
         elif op == '<=' or op == '7':
-            self.emit(f"  sgt {result}, {lreg}, {rreg}")
-            self.emit(f"  xori {result}, {result}, 1")
+            self.emit(f"  sgt {result}, {lreg}, {rreg}      # Comprobar si {lreg} > {rreg}")
+            self.emit(f"  xori {result}, {result}, 1        # Negar resultado: {result} = 1 si {lreg} <= {rreg}")
         elif op == '>' or op == '6':
-            self.emit(f"  sgt {result}, {lreg}, {rreg}")
+            self.emit(f"  sgt {result}, {lreg}, {rreg}      # {result} = 1 si {lreg} > {rreg}, 0 en caso contrario")
         elif op == '>=' or op == '8':
-            self.emit(f"  slt {result}, {lreg}, {rreg}")
-            self.emit(f"  xori {result}, {result}, 1")
+            self.emit(f"  slt {result}, {lreg}, {rreg}      # Comprobar si {lreg} < {rreg}")
+            self.emit(f"  xori {result}, {result}, 1        # Negar resultado: {result} = 1 si {lreg} >= {rreg}")
         # Operaciones lógicas
         elif op == '&&' or op == '10':
-            self.emit(f"  snez {result}, {lreg}")
+            self.emit(f"  snez {result}, {lreg}             # Convertir {lreg} a booleano (0 o 1)")
             temp = self.new_reg()
-            self.emit(f"  snez {temp}, {rreg}")
-            self.emit(f"  and {result}, {result}, {temp}")
+            self.emit(f"  snez {temp}, {rreg}               # Convertir {rreg} a booleano (0 o 1)")
+            self.emit(f"  and {result}, {result}, {temp}    # {result} = {lreg} && {rreg}")
         elif op == '||' or op == '11':
-            self.emit(f"  or {result}, {lreg}, {rreg}")
-            self.emit(f"  snez {result}, {result}")
+            self.emit(f"  or {result}, {lreg}, {rreg}       # Combinar bits con OR")
+            self.emit(f"  snez {result}, {result}           # {result} = 1 si {lreg} || {rreg} es verdadero")
         else:
             print(f"ADVERTENCIA: Operador desconocido '{op}', tratando como suma")
-            self.emit(f"  add {result}, {lreg}, {rreg}")
+            self.emit(f"  add {result}, {lreg}, {rreg}      # ADVERTENCIA: Operador desconocido '{op}', tratado como suma")
         
         return result
 
     def visit_Number(self, n: Number):
         r = self.new_reg()
-        self.emit(f"  li {r}, {n.value}")
+        self.emit(f"  li {r}, {n.value}                # Cargar constante {n.value}")
         return r
 
     def visit_Variable(self, node):
@@ -607,12 +646,13 @@ class RiscVGenerator:
         # Verificar si la variable existe en la tabla de símbolos
         if var_name not in self.symtab:
             print(f"ERROR: Variable '{var_name}' no encontrada en la tabla de símbolos: {self.symtab}")
-            self.emit(f"  li {r}, 0  # ERROR: Variable {var_name} no encontrada, usando 0")
+            self.emit(f"  li {r}, 0                    # ERROR: Variable '{var_name}' no encontrada, usando 0")
             return r
         
         # Cargar el valor de la variable desde su offset en el stack
         off = self.symtab[var_name]
-        self.emit(f"  lw {r}, {off}(s0)  # carga {var_name}")
+        self.emit(f"  lw {r}, {off}(s0)               # Cargar valor de variable '{var_name}'")
+        self.reg_to_var[r] = var_name  # Registrar qué variable está en este registro
         return r
 
     def visit_FuncCall(self, node):
@@ -625,17 +665,33 @@ class RiscVGenerator:
             func_name = node.name
             args = node.args
         
+        # NUEVO: Verificar si la función está declarada
+        if func_name not in self.declared_functions:
+            error_msg = f"ERROR: Llamada a función no declarada '{func_name}'"
+            print(error_msg)
+            self.emit(f"  # {error_msg}")
+            self.has_errors = True
+            # Retornar un registro temporal para no interrumpir la generación
+            # Aunque este código no sea correcto, permite continuar la compilación
+            # para encontrar más errores
+            return self.new_reg()
+        
+        # Comentario descriptivo de la llamada
+        args_desc = f"{len(args)} argumento{'s' if len(args) != 1 else ''}"
+        self.emit(f"# Llamada a función: {func_name}({args_desc})")
+        
         # Evaluar y mover cada argumento a los registros a0-a7
         for i, arg in enumerate(args):
+            self.emit(f"# Preparar argumento {i+1}")
             areg = self.visit(arg)
-            self.emit(f"  mv a{i}, {areg}   # arg {i}")
+            self.emit(f"  mv a{i}, {areg}               # Colocar argumento {i+1} en a{i}")
         
         # Llamar a la función
-        self.emit(f"  call {func_name}")
+        self.emit(f"  call {func_name}                # Llamar a función")
         
         # Mover el resultado (a0) a un registro temporal
         ret = self.new_reg()
-        self.emit(f"  mv {ret}, a0   # resultado de {func_name}")
+        self.emit(f"  mv {ret}, a0                   # Guardar resultado de '{func_name}' en {ret}")
         return ret
 
     def visit_ArrayAccess(self, node):
@@ -646,7 +702,11 @@ class RiscVGenerator:
         if hasattr(array_name, 'value'):
             array_name = array_name.value
         
+        # Comentario descriptivo del acceso al array
+        self.emit(f"# Acceso a array: {array_name}[<índice>]")
+        
         # Calcular el índice
+        self.emit(f"# Calcular índice del array")
         index_reg = self.visit(node.index)
         
         # Obtener un registro para el resultado
@@ -655,20 +715,36 @@ class RiscVGenerator:
         # Si es una variable global
         if array_name in self.globals:
             # Calcular dirección: base_addr + index * 4
-            self.emit(f"  la {result_reg}, {array_name}   # Dirección base del array")
+            self.emit(f"  la {result_reg}, {array_name}    # Cargar dirección base del array global '{array_name}'")
             temp_reg = self.new_reg()
-            self.emit(f"  slli {temp_reg}, {index_reg}, 2   # Índice * 4 (tamaño de int)")
-            self.emit(f"  add {result_reg}, {result_reg}, {temp_reg}   # Dirección del elemento")
+            self.emit(f"  slli {temp_reg}, {index_reg}, 2  # Multiplicar índice por 4 (tamaño de int)")
+            self.emit(f"  add {result_reg}, {result_reg}, {temp_reg} # Calcular dirección del elemento")
             
             # Cargar el valor desde la dirección calculada
             value_reg = self.new_reg()
-            self.emit(f"  lw {value_reg}, 0({result_reg})   # Cargar valor de {array_name}[{index_reg}]")
+            self.emit(f"  lw {value_reg}, 0({result_reg})  # Cargar valor de {array_name}[<índice>]")
             
             return value_reg
         else:
-            # Arrays locales - implementación simplificada
-            print(f"ADVERTENCIA: Acceso a array local no implementado completamente: {array_name}")
-            return self.new_reg()  # Retornar un registro temporal
+            # Arrays locales
+            if array_name in self.symtab:
+                base_off = self.symtab[array_name]
+                self.emit(f"# Acceso a array local '{array_name}' en offset {base_off}")
+                addr_reg = self.new_reg()
+                self.emit(f"  addi {addr_reg}, s0, {base_off} # Dirección base del array")
+                
+                offset_reg = self.new_reg()
+                self.emit(f"  slli {offset_reg}, {index_reg}, 2 # Convertir índice a bytes (×4)")
+                self.emit(f"  add {addr_reg}, {addr_reg}, {offset_reg} # Calcular dirección final")
+                
+                value_reg = self.new_reg()
+                self.emit(f"  lw {value_reg}, 0({addr_reg}) # Cargar valor del array")
+                return value_reg
+            else:
+                # Error: array no declarado
+                print(f"ERROR: Array '{array_name}' no encontrado")
+                self.emit(f"# ERROR: Array '{array_name}' no encontrado")
+                return self.new_reg()  # Retornar un registro temporal
 
     def visit_ArrayDeclaration(self, node: ArrayDeclaration):
         """Reserva espacio en .data para un array global."""
@@ -676,47 +752,57 @@ class RiscVGenerator:
         typ  = node.var_type
         size = node.size
         self.globals.add(name)
+        self.emit(f"# Array global: {typ} {name}[{size}]")
         self.emit("  .align 2")
         self.emit(f"  .globl {name}")
-        self.emit(f"  {name}: .space {size * 4}   # array global {typ} {name}[{size}]")
+        self.emit(f"  {name}: .space {size * 4}   # Reservar {size * 4} bytes para array de {size} elementos")
 
     def visit_MultiDeclaration(self, m: MultiDeclaration):
         """Maneja declaraciones múltiples de variables"""
+        self.emit(f"# Declaración múltiple: {m.var_type} {', '.join(m.var_names)}")
         for var_name in m.var_names:
             # Similar a visit_Declaration pero sin valor inicial
             self.sp_offset -= 4
             self.symtab[var_name] = self.sp_offset
-            self.emit(f"  sw zero, {self.sp_offset}(s0)  # {var_name} = 0 (inicialización)")
-            
-            # Necesitamos también pre-procesar estas declaraciones
+            self.emit(f"  sw zero, {self.sp_offset}(s0)  # Inicializar '{var_name}' a 0")
 
     def visit_For(self, node: For):
         L_cond = self.new_label()
         L_body = self.new_label()
         L_end = self.new_label()
+        L_update = self.new_label()
 
+        self.emit(f"# ----- Inicio de bucle for -----")
+        
         # 1. Inicialización
         if node.init:
+            self.emit(f"# Inicialización del bucle for")
             self.visit(node.init)
         
-        self.emit(f"  j {L_cond}")
+        self.emit(f"  j {L_cond}                      # Saltar a evaluación de condición")
 
         # 2. Cuerpo del bucle
-        self.emit(f"{L_body}:")
+        self.emit(f"{L_body}:                          # Inicio del cuerpo del bucle for")
+        self.emit(f"# Cuerpo del bucle for")
         self.visit(node.body)
-
+        
         # 3. Actualización
+        self.emit(f"{L_update}:                        # Actualización del bucle for")
         if node.update:
+            self.emit(f"# Actualización del bucle for")
             self.visit(node.update)
         
         # 4. Comprobación de condición
-        self.emit(f"{L_cond}:")
+        self.emit(f"{L_cond}:                          # Evaluación de condición del bucle for")
         if node.condition:
+            self.emit(f"# Evaluar condición del bucle for")
             r_cond = self.visit(node.condition)
-            self.emit(f"  bne {r_cond}, zero, {L_body}")
+            self.emit(f"  bne {r_cond}, zero, {L_body}   # Si condición es verdadera, ejecutar cuerpo")
         else:
-            self.emit(f"  j {L_body}")  # Bucle infinito si no hay condición
+            self.emit(f"# Bucle for sin condición (infinito)")
+            self.emit(f"  j {L_body}                    # Bucle infinito (no hay condición)")
 
         # 5. Fin del bucle
-        self.emit(f"{L_end}:")
+        self.emit(f"{L_end}:                          # Fin del bucle for")
+        self.emit(f"# ----- Fin de bucle for -----")
 
