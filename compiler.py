@@ -170,12 +170,12 @@ def compile_smallc(source_code_string, output_filename="output.asm"):
 # Corrección del método declaration problemático
 def declaration_fixed(self, *args):
     """Maneja cualquier forma de declaración recibiendo argumentos variables."""
-    print(f"DEBUG: declaration_fixed llamado con self={self} y args={args}")
+
     
     # Detectamos si recibimos una lista dentro de args
     if len(args) == 1 and isinstance(args[0], list):
         items = args[0]
-        print(f"DEBUG: Extrayendo items de la lista: {items}")
+
         
         # Procesamos los elementos de la lista
         type_val = items[0]  # El tipo (int, char, etc.)
@@ -456,31 +456,54 @@ def main():
             print(print_ast_json(prog))
             print("--------------------")
             
-            # Generar código ensamblador
-            generator = RiscVGenerator()
+            # GENERAR CÓDIGO CON COMENTARIOS
+            generator_commented = RiscVGenerator(clean_mode=False)
             try:
-                asm = generator.generate(prog)
+                asm_commented = generator_commented.generate(prog)
                 
-                # Mostrar código ensamblador
-                print("--- Salida Ensamblador ---")
-                print(asm)
-                print("-------------------------")
+                # Mostrar código ensamblador con comentarios
+                print("--- Salida Ensamblador (Con Comentarios) ---")
+                print(asm_commented)
+                print("----------------------------------------")
                 
-                # Escribir a archivo
+                # Escribir archivo con comentarios
                 with open("output.asm", "w") as f:
-                    f.write(asm)
-                print("✅ output.asm generado correctamente")
+                    f.write(asm_commented)
+                print("✅ output.asm generado correctamente (con comentarios)")
                 
             except Exception as e:
-                print(f"Error al generar código: {e}")
+                print(f"Error al generar código con comentarios: {e}")
+                raise e
+            
+            # GENERAR CÓDIGO SIN COMENTARIOS
+            generator_clean = RiscVGenerator(clean_mode=True)
+            try:
+                asm_clean = generator_clean.generate(prog)
+                
+                # Mostrar código ensamblador limpio (solo primeras líneas)
+                print("--- Salida Ensamblador (Sin Comentarios) ---")
+                lines = asm_clean.split('\n')
+                preview_lines = lines[:20]  # Mostrar solo 20 líneas de preview
+                print('\n'.join(preview_lines))
+                if len(lines) > 20:
+                    print(f"... y {len(lines) - 20} líneas más")
+                print("----------------------------------------")
+                
+                # Escribir archivo sin comentarios
+                with open("output_clean.asm", "w") as f:
+                    f.write(asm_clean)
+                print("✅ output_clean.asm generado correctamente (sin comentarios)")
+                
+            except Exception as e:
+                print(f"Error al generar código sin comentarios: {e}")
                 import traceback
                 traceback.print_exc()
                 
-                # Usar el fallback si hay un error
+                # Si falla la versión limpia, generar una versión simple
                 fallback_asm = generate_minimal_asm()
-                with open("output.asm", "w") as f:
+                with open("output_clean.asm", "w") as f:
                     f.write(fallback_asm)
-                print("⚠️ output.asm generado con código mínimo")
+                print("⚠️ output_clean.asm generado con código mínimo")
                 
     except Exception as e:
         print(f"Error: {e}")
@@ -491,7 +514,9 @@ def main():
         fallback_asm = generate_minimal_asm()
         with open("output.asm", "w") as f:
             f.write(fallback_asm)
-        print("⚠️ output.asm generado con código mínimo")
+        with open("output_clean.asm", "w") as f:
+            f.write(fallback_asm)
+        print("⚠️ Ambos archivos generados con código mínimo")
 
 if __name__ == "__main__":
     main()

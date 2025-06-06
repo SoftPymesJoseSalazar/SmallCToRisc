@@ -2,7 +2,7 @@ from frontend.ast_nodes import *
 from lark import Tree, Token
 
 class RiscVGenerator:
-    def __init__(self):
+    def __init__(self, clean_mode=False):
         self.output = []
         self.regs = [f"x{i}" for i in range(5, 15)]
         self.reg_idx = 0
@@ -18,6 +18,10 @@ class RiscVGenerator:
         # Nueva adición: Tabla de símbolos para funciones declaradas
         self.declared_functions = set()
         self.has_errors = False  # Indicador de errores semánticos
+        self.global_arrays = {}  # Para registrar arrays globales
+        
+        # NUEVO: Modo limpio sin comentarios
+        self.clean_mode = clean_mode
 
     def new_reg(self):
         r = self.regs[self.reg_idx]
@@ -29,6 +33,33 @@ class RiscVGenerator:
         return f"L{self.label_count}"
 
     def emit(self, code):
+        # Si estamos en clean_mode, filtrar comentarios
+        if self.clean_mode:
+            # Si la línea es solo un comentario, no agregarla
+            stripped = code.strip()
+            if stripped.startswith('#') or stripped.startswith('//'):
+                return
+            
+            # Si hay comentario inline, removerlo
+            if '#' in code:
+                # Buscar el primer # que no esté dentro de comillas
+                in_quotes = False
+                comment_pos = -1
+                for i, char in enumerate(code):
+                    if char == '"' and (i == 0 or code[i-1] != '\\'):
+                        in_quotes = not in_quotes
+                    elif char == '#' and not in_quotes:
+                        comment_pos = i
+                        break
+                
+                if comment_pos != -1:
+                    # Remover comentario pero mantener espacios para alineación
+                    code = code[:comment_pos].rstrip()
+                    
+                    # Si después de remover comentario queda solo espacios, no agregar
+                    if not code.strip():
+                        return
+        
         self.output.append(code)
 
     def _flatten(self, items):
@@ -91,8 +122,9 @@ class RiscVGenerator:
             # Solo procesar declaraciones globales en esta fase
             if (isinstance(node, Declaration) or 
                 isinstance(node, ArrayDeclaration) or
+                isinstance(node, StringArrayDeclaration) or
                 isinstance(node, MultiDeclaration) or
-                (isinstance(node, dict) and node.get('type') in ('declaration', 'array_declaration', 'multideclaration'))):
+                (isinstance(node, dict) and node.get('type') in ('declaration', 'array_declaration', 'string_array_declaration', 'multideclaration'))):
                 self.visit(node)
 
         # 3) Sección .text y etiqueta _start
@@ -140,157 +172,9 @@ class RiscVGenerator:
         if hasattr(self, method):
             return getattr(self, method)(node)
         
-        # --- COMPATIBILIDAD TEMPORAL CON FORMATOS ANTIGUOS ---
-        # Este código debe eliminarse gradualmente
-        
-        # Manejo de nodos de tipo 'stmt'
-        if isinstance(node, dict) and node.get('type') == 'stmt' and 'children' in node:
-            # Si 'stmt' contiene children, visitar el primer hijo
-            if node['children'] and len(node['children']) > 0:
-                return self.visit(node['children'][0])
-            return None
-        
-        # Manejo de bloques en nodos dict
-        if isinstance(node, dict) and node.get('type') == 'block' and 'statements' in node:
-            # Para cada declaración en el bloque
-            for stmt in node['statements']:
-                self.visit(stmt)
-            return None
-        
-        # Si es un diccionario con 'type', procesarlo según su tipo
-        if isinstance(node, dict) and 'type' in node:
-            # Mapeo de nombres de métodos para tipos de nodos
-            type_method_map = {
-                'declaration': 'visit_Declaration',
-                'assignment': 'visit_Assignment',
-                'if': 'visit_If',
-                'while': 'visit_While',
-                'return': 'visit_Return',
-                'function_call': 'visit_FuncCall',
-                'binary_op': 'visit_BinaryOp',
-                'variable': 'visit_Variable',
-                'number': 'visit_Number',
-                'function': 'visit_Function',
-                'block': 'visit_Block',
-                'parameter': 'visit_Parameter',
-                'program': 'visit_Program',
-                'array_access': 'visit_ArrayAccess',
-                'array_declaration': 'visit_ArrayDeclaration',
-                'multi_declaration': 'visit_MultiDeclaration',
-                'for': 'visit_For'
-            }
-            
-            # Si tenemos un método para este tipo
-            if node['type'] in type_method_map:
-                method_name = type_method_map[node['type']]
-                if hasattr(self, method_name):
-                    # DEPRECADO: Crear objeto AST temporal (esto debería eliminarse)
-                    try:
-                        # Intentar adaptar el nodo dict a su equivalente en AST
-                        from frontend.ast_nodes import Declaration, Assignment, If, While, Return as ReturnNode, FuncCall, BinaryOp, Variable, Number, Block, Parameter, Program, Function
-                        
-                        if node['type'] == 'declaration':
-                            obj = Declaration(
-                                node.get('var_name', ''), 
-                                node.get('var_type', ''), 
-                                node.get('value', None)
-                            )
-                            return getattr(self, method_name)(obj)
-                        elif node['type'] == 'assignment':
-                            obj = Assignment(
-                                node.get('var_name', ''), 
-                                node.get('value', None)
-                            )
-                            return getattr(self, method_name)(obj)
-                        elif node['type'] == 'return':
-                            # Manejar return statement
-                            expr = None
-                            if 'children' in node and node['children']:
-                                # Buscar la expresión en los children
-                                for child in node['children']:
-                                    if not isinstance(child, str) and child != ';':
-                                        expr = child
-                                        break
-                            elif 'expression' in node:
-                                expr = node['expression']
-                            
-                            return self.visit_Return(Return(expr))
-                        elif node['type'] == 'multideclaration':
-                            # Manejar declaración múltiple
-                            var_type = node.get('var_type', '')
-                            var_names = node.get('var_names', [])
-                            obj = MultiDeclaration(var_type, var_names)
-                            return self.visit_MultiDeclaration(obj)
-                        elif node['type'] == 'if':
-                            # Para if, crear un objeto If
-                            condition = node['children'][0] if len(node['children']) > 0 else None
-                            true_body = node['children'][1] if len(node['children']) > 1 else None
-                            false_body = node['children'][2] if len(node['children']) > 2 and node['children'][2] is not None else None
-                            from frontend.ast_nodes import If as IfNode
-                            return self.visit_If(IfNode(condition, true_body, false_body))
-                        elif node['type'] == 'while':
-                            # Para while, crear un objeto While
-                            condition = node['children'][0] if len(node['children']) > 0 else None
-                            body = node['children'][1] if len(node['children']) > 1 else None
-                            from frontend.ast_nodes import While as WhileNode
-                            return self.visit_While(WhileNode(condition, body))
-                        elif node['type'] == 'for_init':
-                            # Para for_init, procesar el primer hijo (assignment)
-                            if node['children'] and len(node['children']) > 0:
-                                return self.visit(node['children'][0])
-                            return None
-                        else:
-                            # Enviar el nodo dict tal cual
-                            return getattr(self, method_name)(node)
-                    except Exception as e:
-                        print(f"ERROR al adaptar nodo dict a AST: {e}")
-                        return getattr(self, method_name)(node)
-            
-            # Si no tenemos un método específico, pero es un nodo "hijo"
-            if 'children' in node and isinstance(node['children'], list) and node['children']:
-                return self.visit(node['children'][0])
-        
-        # Manejo de árboles de Lark (ESTO DEBERÍA ELIMINARSE)
-        if isinstance(node, Tree):
-            if hasattr(node, 'children') and node.children:
-                # Convertir Tree.children a una lista normal
-                children = list(node.children)
-                
-                # Casos especiales para diferentes tipos de Tree
-                if node.data == 'stmt':
-                    # Para stmt, procesar el primer hijo
-                    if children:
-                        return self.visit(children[0])
-                elif node.data == 'return':
-                    # Para return, crear un objeto Return
-                    expr = None
-                    for child in children:
-                        if not isinstance(child, Token) or child.type != 'SEMICOLON':
-                            expr = child
-                            break
-                    return self.visit_Return(Return(expr))
-                elif node.data == 'if':
-                    # Para if, crear un objeto If
-                    condition = children[0] if len(children) > 0 else None
-                    true_body = children[1] if len(children) > 1 else None
-                    false_body = children[2] if len(children) > 2 and children[2] is not None else None
-                    from frontend.ast_nodes import If as IfNode
-                    return self.visit_If(IfNode(condition, true_body, false_body))
-                elif node.data == 'while':
-                    # Para while, crear un objeto While
-                    condition = children[0] if len(children) > 0 else None
-                    body = children[1] if len(children) > 1 else None
-                    from frontend.ast_nodes import While as WhileNode
-                    return self.visit_While(WhileNode(condition, body))
-                elif node.data == 'for_init':
-                    # Para for_init, procesar el primer hijo (assignment)
-                    if children and len(children) > 0:
-                        return self.visit(children[0])
-                    return None
-        
-        # Si es un Token, obtén su valor
-        if isinstance(node, Token) or (hasattr(node, 'type') and hasattr(node, 'value')):
-            return node.value
+        # Si es un diccionario, procesarlo
+        if isinstance(node, dict):
+            return self.visit_dict(node)
         
         # Si es una lista, procesar cada elemento
         if isinstance(node, list):
@@ -302,11 +186,177 @@ class RiscVGenerator:
             return results[-1] if results else None
         
         # Si llegamos aquí, no tenemos un manejador específico
-        print(f"ADVERTENCIA: No hay método visit_{type(node).__name__} para {node}")
-        # Intenta devolver un valor si es posible
         if hasattr(node, 'value'):
             return node.value
         return None
+
+    def visit_dict(self, node):
+        """Visita un nodo en formato diccionario"""
+        if not isinstance(node, dict) or 'type' not in node:
+            return None
+            
+        node_type = node['type']
+        
+        # Casos especiales
+        if node_type == 'stmt':
+            # Procesar statements
+            if 'children' in node and node['children']:
+                child = node['children'][0]
+                # Si el hijo es un if con múltiples children, procesarlo especialmente
+                if isinstance(child, dict) and child.get('type') == 'if' and len(child.get('children', [])) > 2:
+                    return self.visit_complex_if(child)
+                return self.visit(child)
+        elif node_type == 'if':
+            # Convertir if dict a objeto If
+            children = node.get('children', [])
+            if len(children) >= 2:
+                condition = children[0]
+                true_body = children[1]
+                false_body = children[2] if len(children) > 2 else None
+                from frontend.ast_nodes import If as IfNode
+                return self.visit_If(IfNode(condition, true_body, false_body))
+        elif node_type == 'block':
+            # Procesar bloque
+            if 'statements' in node:
+                for stmt in node['statements']:
+                    self.visit(stmt)
+            return None
+        elif node_type == 'declaration':
+            # Convertir declaration dict a objeto Declaration
+            from frontend.ast_nodes import Declaration
+            obj = Declaration(
+                node.get('var_name', ''), 
+                node.get('var_type', ''), 
+                node.get('value', None)
+            )
+            return self.visit_Declaration(obj)
+        elif node_type == 'assignment':
+            # Convertir assignment dict a objeto Assignment
+            from frontend.ast_nodes import Assignment
+            obj = Assignment(
+                node.get('var_name', ''), 
+                node.get('value', None)
+            )
+            return self.visit_Assignment(obj)
+        elif node_type == 'return':
+            # Convertir return dict a objeto Return
+            expr = None
+            if 'children' in node and node['children']:
+                for child in node['children']:
+                    if not isinstance(child, str) and child != ';':
+                        expr = child
+                        break
+            elif 'expression' in node:
+                expr = node['expression']
+            from frontend.ast_nodes import Return
+            return self.visit_Return(Return(expr))
+        elif node_type == 'binary_op':
+            # Convertir binary_op dict a objeto BinaryOp
+            from frontend.ast_nodes import BinaryOp
+            obj = BinaryOp(
+                node.get('op', ''),
+                node.get('left', None),
+                node.get('right', None)
+            )
+            return self.visit_BinaryOp(obj)
+        elif node_type == 'variable':
+            # Convertir variable dict a objeto Variable
+            from frontend.ast_nodes import Variable
+            obj = Variable(node.get('name', ''))
+            return self.visit_Variable(obj)
+        elif node_type == 'number':
+            # Convertir number dict a objeto Number
+            from frontend.ast_nodes import Number
+            obj = Number(node.get('value', 0))
+            return self.visit_Number(obj)
+        elif node_type == 'function_call':
+            # Convertir function_call dict a objeto FuncCall
+            from frontend.ast_nodes import FuncCall
+            obj = FuncCall(
+                node.get('name', ''),
+                node.get('args', [])
+            )
+            return self.visit_FuncCall(obj)
+        elif node_type == 'while':
+            # Convertir while dict a objeto While
+            from frontend.ast_nodes import While as WhileNode
+            children = node.get('children', [])
+            if len(children) >= 2:
+                condition = children[0]
+                body = children[1]
+                return self.visit_While(WhileNode(condition, body))
+            else:
+                self.emit(f"  # ERROR: while malformado - necesita condición y cuerpo")
+                return None
+        
+        # Si no hay caso específico, buscar en children
+        if 'children' in node and node['children']:
+            return self.visit(node['children'][0])
+        
+        return None
+
+    def visit_complex_if(self, node):
+        """Maneja estructuras if-else-if complejas"""
+        children = node.get('children', [])
+        if len(children) < 2:
+            return None
+        
+        # Labels para el control de flujo
+        labels_end = []
+        label_final = self.new_label()
+        
+        self.emit(f"  # ----- Estructura if-else-if compleja -----")
+        
+        i = 0
+        while i < len(children):
+            if i == 0:
+                # Primera condición (if inicial)
+                self.emit(f"  # Evaluación de condición if principal")
+                r_cond = self.visit(children[i])
+                label_next = self.new_label()
+                labels_end.append(label_next)
+                self.emit(f"  beq {r_cond}, zero, {label_next}  # Si condición es falsa, saltar a siguiente")
+                
+                # Cuerpo del if
+                if i + 1 < len(children):
+                    self.emit(f"  # Cuerpo del if principal")
+                    self.visit(children[i + 1])
+                    self.emit(f"  j {label_final}  # Saltar al final")
+                i += 2
+                
+            elif i + 1 < len(children) and i + 2 < len(children):
+                # else if (condición + cuerpo)
+                self.emit(f"{labels_end[-1]}:")  # Etiqueta del salto anterior
+                labels_end.pop()
+                
+                self.emit(f"  # Evaluación de condición else-if")
+                r_cond = self.visit(children[i])
+                label_next = self.new_label()
+                labels_end.append(label_next)
+                self.emit(f"  beq {r_cond}, zero, {label_next}  # Si condición es falsa, saltar a siguiente")
+                
+                # Cuerpo del else if
+                self.emit(f"  # Cuerpo del else-if")
+                self.visit(children[i + 1])
+                self.emit(f"  j {label_final}  # Saltar al final")
+                i += 2
+                
+            else:
+                # else final (solo cuerpo, sin condición)
+                if labels_end:
+                    self.emit(f"{labels_end[-1]}:")  # Etiqueta del último salto
+                    labels_end.pop()
+                
+                self.emit(f"  # Cuerpo del else final")
+                self.visit(children[i])
+                break
+        
+        # Limpiar etiquetas restantes
+        for label in labels_end:
+            self.emit(f"{label}:")
+        
+        self.emit(f"{label_final}:")
+        self.emit(f"  # ----- Fin estructura if-else-if compleja -----")
 
     def visit_Function(self, fn):
         """Genera código para una función."""
@@ -345,6 +395,8 @@ class RiscVGenerator:
             param_name = None
             if isinstance(p, Parameter):
                 param_name = p.name
+            elif hasattr(p, '__class__') and p.__class__.__name__ == 'ArrayParameter':
+                param_name = p.name
             elif isinstance(p, dict):
                 param_name = p.get('param_name') or p.get('name')
             else:
@@ -380,7 +432,12 @@ class RiscVGenerator:
         if fn_params:
             self.emit(f"# Copiar argumentos de registros a0-a{len(fn_params)-1} a stack frame")
         for i, p in enumerate(fn_params):
-            param_name = p.name if isinstance(p, Parameter) else f"param{i}"
+            if isinstance(p, Parameter):
+                param_name = p.name
+            elif hasattr(p, '__class__') and p.__class__.__name__ == 'ArrayParameter':
+                param_name = p.name
+            else:
+                param_name = f"param{i}"
             off = self.symtab[param_name]
             self.emit(f"  sw a{i}, {off}(s0)      # Guardar parámetro '{param_name}' en stack")
         
@@ -416,49 +473,35 @@ class RiscVGenerator:
             self.sp_offset -= 4
             self.symtab[node.var_name] = self.sp_offset
             print(f"REGISTRO: Variable {node.var_name} en offset {self.sp_offset}")
-        # Si es una declaración múltiple, procesar cada variable
+        elif isinstance(node, ArrayDeclaration):
+            # Array global - no necesita espacio en stack local
+            pass
+        elif isinstance(node, StringArrayDeclaration):
+            # String array global - no necesita espacio en stack local
+            pass
         elif isinstance(node, MultiDeclaration):
             for var_name in node.var_names:
                 self.sp_offset -= 4
                 self.symtab[var_name] = self.sp_offset
-                print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
-        # Compatibilidad temporal con formato dict para declaraciones
+                print(f"REGISTRO: Variable multi {var_name} en offset {self.sp_offset}")
+        # Compatibilidad temporal con declaraciones de tipo dict
         elif isinstance(node, dict) and node.get('type') == 'declaration':
-            var_name = node.get('var_name', '')
+            var_name = node.get('var_name', 'unknown')
             self.sp_offset -= 4
             self.symtab[var_name] = self.sp_offset
-            print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
-        # Si es una declaración múltiple, procesar cada variable
-        elif isinstance(node, dict) and node.get('type') == 'multideclaration':
-            var_names = node.get('var_names', [])
-            for var_name in var_names:
-                self.sp_offset -= 4
-                self.symtab[var_name] = self.sp_offset
-                print(f"REGISTRO: Variable {var_name} en offset {self.sp_offset}")
-        # Si es un if, procesar ambos bloques
-        elif isinstance(node, If):
-            self.pre_process_declarations(node.true_body)
-            if node.false_body:
-                self.pre_process_declarations(node.false_body)
-        # Compatibilidad temporal con formato dict para if
-        elif isinstance(node, dict) and node.get('type') == 'if':
-            if 'body' in node or 'true_body' in node:
-                body = node.get('body') or node.get('true_body')
-                self.pre_process_declarations(body)
-            if ('else_body' in node and node['else_body']) or ('false_body' in node and node['false_body']):
-                else_body = node.get('else_body') or node.get('false_body')
-                self.pre_process_declarations(else_body)
-        # Si es un while, procesar su bloque
-        elif isinstance(node, While):
+            print(f"REGISTRO: Variable dict {var_name} en offset {self.sp_offset}")
+        # Procesar recursivamente en bloques y otras estructuras
+        elif hasattr(node, 'body'):
             self.pre_process_declarations(node.body)
-        # Compatibilidad temporal con formato dict para while
-        elif isinstance(node, dict) and node.get('type') == 'while':
-            if 'body' in node:
-                self.pre_process_declarations(node.get('body'))
-        # Si es un for, procesar inicialización y cuerpo
+        elif hasattr(node, 'true_body'):
+            self.pre_process_declarations(node.true_body)
+            if hasattr(node, 'false_body') and node.false_body:
+                self.pre_process_declarations(node.false_body)
         elif isinstance(node, For):
             if node.init:
                 self.pre_process_declarations(node.init)
+            self.pre_process_declarations(node.body)
+        elif isinstance(node, While):
             self.pre_process_declarations(node.body)
         
         # Retornar el espacio requerido para variables locales
@@ -736,7 +779,7 @@ class RiscVGenerator:
         
         # Descripción legible de la operación
         op_desc = {
-            '+': 'suma', '-': 'resta', '*': 'multiplicación', '/': 'división',
+            '+': 'suma', '-': 'resta', '*': 'multiplicación', '/': 'división', '%': 'módulo',
             '==': 'igualdad', '!=': 'desigualdad', 
             '<': 'menor que', '>': 'mayor que', 
             '<=': 'menor o igual que', '>=': 'mayor o igual que',
@@ -754,6 +797,8 @@ class RiscVGenerator:
             self.emit(f"  mul {result}, {lreg}, {rreg}      # {result} = {lreg} * {rreg}")
         elif op == '/':
             self.emit(f"  div {result}, {lreg}, {rreg}      # {result} = {lreg} / {rreg}")
+        elif op == '%':
+            self.emit(f"  rem {result}, {lreg}, {rreg}      # {result} = {lreg} % {rreg}")
         # Operaciones de comparación
         elif op == '==' or op == '0':
             self.emit(f"  xor {result}, {lreg}, {rreg}      # XOR para comparar bits")
@@ -789,6 +834,21 @@ class RiscVGenerator:
     def visit_Number(self, n: Number):
         r = self.new_reg()
         self.emit(f"  li {r}, {n.value}                # Cargar constante {n.value}")
+        return r
+
+    def visit_Character(self, c):
+        """Genera código para cargar un carácter (convertido a su valor ASCII)."""
+        r = self.new_reg()
+        # Extraer el carácter sin las comillas
+        char_value = c.value
+        if len(char_value) >= 3:  # 'x' tiene 3 caracteres
+            actual_char = char_value[1]  # Tomar el carácter del medio
+        else:
+            actual_char = char_value
+        
+        # Convertir a valor ASCII
+        ascii_value = ord(actual_char)
+        self.emit(f"  li {r}, {ascii_value}                # Cargar carácter '{actual_char}' (ASCII {ascii_value})")
         return r
 
     def visit_Variable(self, node):
@@ -883,17 +943,29 @@ class RiscVGenerator:
         
         # Si es una variable global
         if array_name in self.globals:
-            # Calcular dirección: base_addr + index * 4
-            self.emit(f"  la {result_reg}, {array_name}    # Cargar dirección base del array global '{array_name}'")
-            temp_reg = self.new_reg()
-            self.emit(f"  slli {temp_reg}, {index_reg}, 2  # Multiplicar índice por 4 (tamaño de int)")
-            self.emit(f"  add {result_reg}, {result_reg}, {temp_reg} # Calcular dirección del elemento")
-            
-            # Cargar el valor desde la dirección calculada
-            value_reg = self.new_reg()
-            self.emit(f"  lw {value_reg}, 0({result_reg})  # Cargar valor de {array_name}[<índice>]")
-            
-            return value_reg
+            # Verificar si es un array de char
+            if array_name in self.global_arrays and self.global_arrays[array_name]['type'] == 'char':
+                # Array de char - usar acceso por bytes
+                self.emit(f"  la {result_reg}, {array_name}    # Cargar dirección base del array global de char '{array_name}'")
+                self.emit(f"  add {result_reg}, {result_reg}, {index_reg} # Calcular dirección del carácter (índice directo)")
+                
+                # Cargar el byte y convertir a word
+                value_reg = self.new_reg()
+                self.emit(f"  lbu {value_reg}, 0({result_reg})  # Cargar byte de {array_name}[<índice>] (sin signo)")
+                
+                return value_reg
+            else:
+                # Array de int - usar acceso por words
+                self.emit(f"  la {result_reg}, {array_name}    # Cargar dirección base del array global '{array_name}'")
+                temp_reg = self.new_reg()
+                self.emit(f"  slli {temp_reg}, {index_reg}, 2  # Multiplicar índice por 4 (tamaño de int)")
+                self.emit(f"  add {result_reg}, {result_reg}, {temp_reg} # Calcular dirección del elemento")
+                
+                # Cargar el valor desde la dirección calculada
+                value_reg = self.new_reg()
+                self.emit(f"  lw {value_reg}, 0({result_reg})  # Cargar valor de {array_name}[<índice>]")
+                
+                return value_reg
         else:
             # Arrays locales
             if array_name in self.symtab:
@@ -916,15 +988,29 @@ class RiscVGenerator:
                 return self.new_reg()  # Retornar un registro temporal
 
     def visit_ArrayDeclaration(self, node: ArrayDeclaration):
-        """Reserva espacio en .data para un array global."""
-        name = node.var_name
-        typ  = node.var_type
-        size = node.size
-        self.globals.add(name)
-        self.emit(f"# Array global: {typ} {name}[{size}]")
-        self.emit("  .align 2")
-        self.emit(f"  .globl {name}")
-        self.emit(f"  {name}: .space {size * 4}   # Reservar {size * 4} bytes para array de {size} elementos")
+        """Genera código para declaración de array global."""
+        # Solo manejar arrays globales por ahora
+        self.global_arrays[node.var_name] = {
+            'type': node.var_type,
+            'size': node.size
+        }
+        
+        # Reservar espacio en la sección .data
+        self.emit(f"{node.var_name}: .space {node.size * 4}  # Array {node.var_type}[{node.size}]")
+
+    def visit_StringArrayDeclaration(self, node):
+        """Genera código para declaración de array de char con string."""
+        # Registrar en globals y arrays globales
+        self.globals.add(node.var_name)
+        self.global_arrays[node.var_name] = {
+            'type': 'char',
+            'size': node.size
+        }
+        
+        # Generar string literal en sección .data
+        # Convertir caracteres especiales
+        escaped_string = node.string_value.replace('\\n', '\\n').replace('\\t', '\\t')
+        self.emit(f"{node.var_name}: .asciz \"{escaped_string}\"  # String array: char {node.var_name}[]")
 
     def visit_MultiDeclaration(self, m: MultiDeclaration):
         """Maneja declaraciones múltiples de variables"""
@@ -998,4 +1084,91 @@ class RiscVGenerator:
         # 5. Fin del bucle
         self.emit(f"{L_end}:                          # Fin del bucle for")
         self.emit(f"# ----- Fin de bucle for -----")
+
+    def visit_Stmt(self, node):
+        """Genera código para una sentencia stmt."""
+        # Si el stmt contiene children, procesar el primer hijo
+        if hasattr(node, 'children') and node.children:
+            child = node.children[0]
+            
+            # Si el hijo es un Tree de Lark (especialmente if o while), procesarlo
+            if hasattr(child, 'data') and child.data == 'if':
+                # Convertir Tree a una estructura procesable
+                from lark import Tree
+                if isinstance(child, Tree):
+                    # Extraer children del Tree
+                    tree_children = [c for c in child.children if not hasattr(c, 'type') or c.type not in ['LPAREN', 'RPAREN']]
+                    
+                    # Si tiene más de 3 children, es un if-else-if complejo
+                    if len(tree_children) > 3:
+                        # Crear un dict temporal para usar visit_complex_if
+                        temp_dict = {
+                            'type': 'if',
+                            'children': tree_children
+                        }
+                        return self.visit_complex_if(temp_dict)
+                    else:
+                        # If normal (con o sin else), crear objeto If directamente
+                        condition = tree_children[0] if len(tree_children) > 0 else None
+                        true_body = tree_children[1] if len(tree_children) > 1 else None
+                        false_body = tree_children[2] if len(tree_children) > 2 else None
+                        from frontend.ast_nodes import If as IfNode
+                        return self.visit_If(IfNode(condition, true_body, false_body))
+            
+            # Si el hijo es un Tree de while, procesarlo
+            elif hasattr(child, 'data') and child.data == 'while':
+                from lark import Tree
+                if isinstance(child, Tree):
+                    # Extraer children del Tree
+                    tree_children = [c for c in child.children if not hasattr(c, 'type') or c.type not in ['LPAREN', 'RPAREN']]
+                    
+                    if len(tree_children) >= 2:
+                        condition = tree_children[0]
+                        body = tree_children[1]
+                        from frontend.ast_nodes import While as WhileNode
+                        return self.visit_While(WhileNode(condition, body))
+                    else:
+                        self.emit(f"  # ERROR: while Tree malformado")
+                        return None
+            
+            # Si el hijo es un Tree de return, procesarlo
+            elif hasattr(child, 'data') and child.data == 'return':
+                from lark import Tree
+                if isinstance(child, Tree):
+                    # Extraer children del Tree
+                    tree_children = [c for c in child.children if not hasattr(c, 'type') or c.type not in ['LPAREN', 'RPAREN', 'SEMICOLON']]
+                    
+                    # El return puede tener una expresión o estar vacío
+                    expr = tree_children[0] if len(tree_children) > 0 else None
+                    from frontend.ast_nodes import Return as ReturnNode
+                    return self.visit_Return(ReturnNode(expr))
+            
+            # Si el hijo es un If con múltiples children en formato dict, procesarlo especialmente
+            elif isinstance(child, dict) and child.get('type') == 'if':
+                children = child.get('children', [])
+                if len(children) > 2:
+                    # Es un if-else-if complejo
+                    return self.visit_complex_if(child)
+                else:
+                    # Es un if simple, procesarlo normalmente
+                    return self.visit(child)
+            
+            # Si el hijo es un While en formato dict, procesarlo especialmente
+            elif isinstance(child, dict) and child.get('type') == 'while':
+                # Crear un objeto While temporal para procesarlo
+                from frontend.ast_nodes import While as WhileNode
+                children = child.get('children', [])
+                if len(children) >= 2:
+                    condition = children[0]
+                    body = children[1]
+                    return self.visit_While(WhileNode(condition, body))
+                else:
+                    # Error: while sin condición o cuerpo
+                    self.emit(f"  # ERROR: while malformado")
+                    return None
+            
+            # Para otros casos, procesar normalmente
+            return self.visit(child)
+        
+        return None
 

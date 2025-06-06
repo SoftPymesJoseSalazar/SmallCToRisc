@@ -12,12 +12,14 @@ global_decl: declaration
            | multi_decl
            | assignment
            | array_decl
+           | string_array_decl
 
 // Declaraciones
 declaration: TYPE ID ["=" expression] SEMICOLON        -> declaration
 multi_decl : TYPE ID (COMMA ID)+ SEMICOLON             -> multi_declaration
 assignment : (ID | array_access) "=" expression SEMICOLON -> assignment
 array_decl : TYPE ID "[" NUMBER "]" SEMICOLON          -> array_declaration
+string_array_decl : TYPE ID "[" "]" "=" STRING SEMICOLON -> string_array_declaration
 
 // Acceso a arrays
 array_access: ID "[" expression "]"                     -> array_access
@@ -27,6 +29,7 @@ function_decl: TYPE ID "(" [param_list] ")" block       -> function
 
 param_list: parameter ( COMMA parameter )*
 parameter : TYPE ID                                      -> parameter
+          | TYPE ID "[" "]"                              -> array_parameter
 
 // Bloques y sentencias
 block     : "{" stmt* "}"                         -> block
@@ -34,6 +37,7 @@ stmt      : declaration
           | multi_decl
           | assignment
           | array_decl
+          | string_array_decl
           | if_stmt
           | while_stmt
           | for_stmt
@@ -42,7 +46,7 @@ stmt      : declaration
           | expression SEMICOLON                        -> expr_stmt
 
 // Estructuras de control
-if_stmt   : "if" "(" expression ")" block ["else" block] -> if
+if_stmt   : "if" "(" expression ")" block ("else" "if" "(" expression ")" block)* ["else" block] -> if
 while_stmt: "while" "(" expression ")" block             -> while
 for_stmt  : "for" "(" for_init SEMICOLON [expression] SEMICOLON for_update ")" block -> for_loop
 
@@ -77,9 +81,11 @@ return_stmt: "return" [expression] SEMICOLON               -> return
 ?term    : factor
          | term STAR  factor                             -> term_mul
          | term SLASH factor                             -> term_div
+         | term MOD   factor                             -> term_mod
 
 ?factor  : NUMBER                                        -> number
          | STRING                                        -> string
+         | CHAR                                          -> character
          | ID                                            -> variable
          | array_access                                  -> array_access
          | function_call
@@ -94,6 +100,7 @@ TYPE      : "int" | "char" | "void"
 ID        : /[a-zA-Z_]\w*/
 NUMBER    : /\d+/
 STRING    : ESCAPED_STRING
+CHAR      : /'.'/ | /'\\.'/
 
 // Puntuación y operadores
 EQ        : "==" 
@@ -108,6 +115,7 @@ PLUS      : "+"
 MINUS     : "-"  
 STAR      : "*"  
 SLASH     : "/"  
+MOD       : "%"
 COMMA     : ","  
 SEMICOLON : ";"  
 
@@ -159,6 +167,9 @@ class ASTTransformer(Transformer):
             if isinstance(p, Parameter):
                 # Ya es un objeto Parameter, usarlo directamente
                 processed_params.append(p)
+            elif hasattr(p, '__class__') and p.__class__.__name__ == 'ArrayParameter':
+                # Es un ArrayParameter, usarlo directamente
+                processed_params.append(p)
             elif isinstance(p, dict) and 'param_name' in p and 'param_type' in p:
                 # Ya es un diccionario con formato correcto
                 processed_params.append(p)
@@ -179,6 +190,16 @@ class ASTTransformer(Transformer):
         
         # Crear y devolver el objeto Parameter
         return Parameter(name_str, type_str)
+
+    def array_parameter(self, t, n, *args):
+        """Transforma un parámetro de array de función."""
+        # Asegurarse de que t y n sean strings
+        type_str = t.value if hasattr(t, 'value') else str(t)
+        name_str = n.value if hasattr(n, 'value') else str(n)
+        
+        # Crear y devolver el objeto ArrayParameter
+        from frontend.ast_nodes import ArrayParameter
+        return ArrayParameter(name_str, type_str)
 
     def param_list(self, *params):
         """Agrupa múltiples parámetros en una lista."""
@@ -248,6 +269,23 @@ class ASTTransformer(Transformer):
                     
         return ArrayDeclaration(n_val, t_val, size)
 
+    def string_array_declaration(self, *args):
+        t_val = None
+        n_val = None
+        string_val = None
+        
+        for arg in args:
+            if isinstance(arg, Token):
+                if arg.type == 'TYPE':
+                    t_val = arg.value
+                elif arg.type == 'ID':
+                    n_val = arg.value
+                elif arg.type == 'STRING':
+                    string_val = arg.value[1:-1]  # Remover comillas
+                    
+        from frontend.ast_nodes import StringArrayDeclaration
+        return StringArrayDeclaration(n_val, string_val)
+
     def array_access(self, *args):
         """Maneja acceso a arrays"""
         # Si recibimos un solo argumento y ya es un ArrayAccess, devolverlo directamente
@@ -271,20 +309,50 @@ class ASTTransformer(Transformer):
         return Block(real_stmts)
 
     def if_stmt(self, *args):
-        cond = None
-        then_b = None
-        else_b = None
+        # Esta función maneja: if (cond1) block1 [else if (cond2) block2]* [else block_final]
         
-        # El primer no-token debe ser la condición
-        for arg in args:
-            if not isinstance(arg, Token) and cond is None:
-                cond = arg
-            elif not isinstance(arg, Token) and cond is not None and then_b is None:
-                then_b = arg
-            elif not isinstance(arg, Token) and cond is not None and then_b is not None:
-                else_b = arg
-                
-        return If(cond, then_b, else_b)
+        # Filtrar solo los elementos que no son tokens
+        non_tokens = [arg for arg in args if not isinstance(arg, Token)]
+        
+        if len(non_tokens) == 0:
+            return None
+            
+        # Primer elemento siempre es la condición del if principal
+        main_condition = non_tokens[0]
+        main_then_block = non_tokens[1] if len(non_tokens) > 1 else None
+        
+        # Si solo tenemos condición y bloque then, es un if simple
+        if len(non_tokens) == 2:
+            return If(main_condition, main_then_block, None)
+        
+        # Si tenemos más elementos, procesarlos secuencialmente 
+        # Para construir la cadena de else-if como if anidados
+        
+        # Construir la estructura desde el final hacia atrás
+        result_if = None
+        
+        # Verificar si el último elemento es un bloque else (sin condición asociada)
+        if len(non_tokens) % 2 == 1:  # Número impar = hay else final
+            final_else_block = non_tokens[-1]
+            remaining_elements = non_tokens[2:-1]  # Desde después del main_then_block hasta antes del else final
+        else:
+            final_else_block = None
+            remaining_elements = non_tokens[2:]  # Desde después del main_then_block hasta el final
+        
+        # Procesar los else-if desde el final hacia el principio
+        i = len(remaining_elements) - 2  # Empezar desde el último par (condición, bloque)
+        
+        while i >= 0:
+            condition = remaining_elements[i]
+            then_block = remaining_elements[i + 1]
+            
+            # Crear un nuevo If con esta condición y el if anterior como else_body
+            new_if = If(condition, then_block, result_if or final_else_block)
+            result_if = new_if
+            i -= 2
+        
+        # El if principal tiene como else_body toda la cadena construida
+        return If(main_condition, main_then_block, result_if or final_else_block)
 
     def while_stmt(self, *args):
         cond = None
@@ -403,11 +471,20 @@ class ASTTransformer(Transformer):
             return BinaryOp("/", operands[0], operands[1])
         return operands[0] if operands else None
 
+    def term_mod(self, *args):
+        operands = [arg for arg in args if not isinstance(arg, Token)]
+        if len(operands) >= 2:
+            return BinaryOp("%", operands[0], operands[1])
+        return operands[0] if operands else None
+
     def number(self, tok):
         return Number(int(tok.value))
 
     def string(self, tok):
         return String(tok.value[1:-1])
+
+    def character(self, tok):
+        return Character(tok.value)
 
     def variable(self, tok):
         return Variable(tok.value)
@@ -451,7 +528,7 @@ class ASTTransformer(Transformer):
     def for_loop(self, *args):
         """Crea un nodo For con inicialización, condición, actualización y cuerpo."""
         # Depuración para ver qué argumentos recibimos
-        print(f"for_loop recibió {len(args)} argumentos")
+
         
         # Extraer los componentes relevantes
         # Asumiendo que los argumentos significativos están en posiciones específicas
@@ -470,6 +547,13 @@ class ASTTransformer(Transformer):
         condition = condition if condition else None
         
         return For(init=init, condition=condition, update=update, body=body)
+
+    def stmt(self, *args):
+        """Transforma un statement envolvente en un objeto Stmt."""
+        # Filtrar tokens y obtener solo el contenido real
+        children = [arg for arg in args if not isinstance(arg, Token)]
+        from frontend.ast_nodes import Stmt
+        return Stmt(children)
 
 def parse(code: str) -> Program:
     """Parsea código SmallC y retorna un AST completo."""

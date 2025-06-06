@@ -19,12 +19,22 @@ class Parameter:
     name: str
     param_type: str
 
+@dataclass
+class ArrayParameter:
+    name: str
+    param_type: str
+    is_array: bool = True
+
 # — Bloques y statements —
 @dataclass
 class Block:
     statements: List['Statement']
 
 class Statement: pass
+
+@dataclass
+class Stmt(Statement):
+    children: List['Expression']
 
 @dataclass
 class Declaration(Statement):
@@ -97,6 +107,14 @@ class ArrayDeclaration:
         self.var_type = var_type
         self.size = size
 
+class StringArrayDeclaration:
+    """Representa una declaración de array de char inicializado con string"""
+    def __init__(self, var_name, string_value):
+        self.var_name = var_name
+        self.var_type = "char"
+        self.string_value = string_value
+        self.size = len(string_value) + 1  # +1 para null terminator
+
 class MultiDeclaration:
     """Representa una declaración múltiple de variables"""
     def __init__(self, var_type, var_names):
@@ -105,4 +123,8 @@ class MultiDeclaration:
 
 @dataclass
 class String(Expression):
-    value: str 
+    value: str
+
+@dataclass
+class Character(Expression):
+    value: str  # El carácter sin las comillas 
