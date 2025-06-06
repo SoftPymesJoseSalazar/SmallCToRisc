@@ -81,6 +81,7 @@ return_stmt: "return" [expression] SEMICOLON               -> return
 ?factor  : NUMBER                                        -> number
          | STRING                                        -> string
          | ID                                            -> variable
+         | array_access                                  -> array_access
          | function_call
          | "(" expression ")"
 
@@ -248,6 +249,11 @@ class ASTTransformer(Transformer):
         return ArrayDeclaration(n_val, t_val, size)
 
     def array_access(self, *args):
+        """Maneja acceso a arrays"""
+        # Si recibimos un solo argumento y ya es un ArrayAccess, devolverlo directamente
+        if len(args) == 1 and isinstance(args[0], ArrayAccess):
+            return args[0]
+        
         n_val = None
         idx = None
         
